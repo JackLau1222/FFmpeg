@@ -213,6 +213,23 @@ static int update_stream_avctx(AVFormatContext *s)
     return 0;
 }
 
+static void remove_format_options(AVDictionary **options, AVDictionary *tmp)
+{
+    const AVDictionaryEntry *o = NULL;
+    const AVDictionaryEntry *t = NULL;
+    while (o = av_dict_iterate(*options, o)) {
+        int tem_flag = 0;
+        while (t = av_dict_iterate(tmp, t)) {
+            if (strcmp(o->key, t->key) == 0) 
+                tem_flag = 1;
+        }
+        if (tem_flag == 0) {
+            av_log(NULL, AV_LOG_DEBUG, "Option '%s' was used once\n", o->key);
+            av_dict_set(options, o->key, NULL, AV_DICT_MATCH_CASE);
+        }
+    }
+}
+
 int avformat_open_input(AVFormatContext **ps, const char *filename,
                         const AVInputFormat *fmt, AVDictionary **options)
 {
@@ -220,6 +237,7 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
     AVFormatContext *s = *ps;
     FFFormatContext *si;
     AVDictionary *tmp = NULL;
+    AVDictionary *tmph = NULL;
     ID3v2ExtraMeta *id3v2_extra_meta = NULL;
     int ret = 0;
 
@@ -234,8 +252,10 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
     if (fmt)
         s->iformat = fmt;
 
-    if (options)
+    if (options) {
         av_dict_copy(&tmp, *options, 0);
+        av_dict_copy(&tmph, *options, 0);
+    }
 
     if (s->pb) // must be before any goto fail
         s->flags |= AVFMT_FLAG_CUSTOM_IO;
@@ -251,6 +271,8 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
     if ((ret = init_input(s, filename, &tmp)) < 0)
         goto fail;
     s->probe_score = ret;
+
+    remove_format_options(options, tmp);
 
     if (!s->protocol_whitelist && s->pb && s->pb->protocol_whitelist) {
         s->protocol_whitelist = av_strdup(s->pb->protocol_whitelist);
@@ -295,10 +317,12 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
         if (s->iformat->priv_class) {
             *(const AVClass **) s->priv_data = s->iformat->priv_class;
             av_opt_set_defaults(s->priv_data);
-            if ((ret = av_opt_set_dict(s->priv_data, &tmp)) < 0)
+            if ((ret = av_opt_set_dict(s->priv_data, &tmph)) < 0)
                 goto fail;
         }
     }
+
+    remove_format_options(options, tmph);
 
     /* e.g. AVFMT_NOFILE formats will not have an AVIOContext */
     if (s->pb)
@@ -342,11 +366,6 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
     fci->raw_packet_buffer_size = 0;
 
     update_stream_avctx(s);
-
-    if (options) {
-        av_dict_free(options);
-        *options = tmp;
-    }
     *ps = s;
     return 0;
 

@@ -227,7 +227,7 @@ typedef struct HLSContext {
     int max_reload;
     int http_persistent;
     int http_multiple;
-    int http_seekable;
+    int seekable;
     int seg_max_retry;
     AVIOContext *playlist_pb;
     HLSCryptoContext  crypto_ctx;
@@ -1993,9 +1993,9 @@ static int hls_read_header(AVFormatContext *s)
         return ret;
 
     /* XXX: Some HLS servers don't like being sent the range header,
-       in this case, need to  setting http_seekable = 0 to disable
+       in this case, need to  setting seekable = 0 to disable
        the range header */
-    av_dict_set_int(&c->avio_opts, "seekable", c->http_seekable, 0);
+    av_dict_set_int(&c->avio_opts, "seekable", c->seekable, 0);
 
     if ((ret = parse_playlist(c, s->url, NULL, s->pb)) < 0)
         return ret;
@@ -2640,8 +2640,8 @@ static const AVOption hls_options[] = {
         OFFSET(http_persistent), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS },
     {"http_multiple", "Use multiple HTTP connections for fetching segments",
         OFFSET(http_multiple), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, FLAGS},
-    {"http_seekable", "Use HTTP partial requests, 0 = disable, 1 = enable, -1 = auto",
-        OFFSET(http_seekable), AV_OPT_TYPE_BOOL, { .i64 = -1}, -1, 1, FLAGS},
+    {"seekable", "Use HTTP partial requests, 0 = disable, 1 = enable, -1 = auto",
+        OFFSET(seekable), AV_OPT_TYPE_BOOL, { .i64 = -1}, -1, 1, FLAGS},
     {"seg_format_options", "Set options for segment demuxer",
         OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
     {"seg_max_retry", "Maximum number of times to reload a segment on error.",

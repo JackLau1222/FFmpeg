@@ -398,6 +398,7 @@ static void write_codec_attr(AVStream *st, VariantStream *vs)
                 int rbsp_size = 0;
                 uint32_t profile_compatibility_flags = 0;
                 uint8_t high_nibble = 0;
+                uint32_t x;
                 /* skip start code + nalu header */
                 data += 6;
                 /* process by reference General NAL unit syntax */
@@ -416,21 +417,19 @@ static void write_codec_attr(AVStream *st, VariantStream *vs)
                  * TIER represents the general_tier_flag, with 'L' indicating the flag is 0,
                  * and 'H' indicating the flag is 1
                  */
-                tier = (int)(rbsp_buf[1] & 0x20) == 0 ? 'L' : 'H';
+                tier = (rbsp_buf[1] & 0x20) == 0 ? 'L' : 'H';
                 profile = rbsp_buf[1] & 0x1f;
                 /* PROFILE_COMPATIBILITY is general_profile_compatibility_flags, but in reverse bit order,
                  * in a hexadecimal representation (leading zeroes may be omitted).
                  */
                 profile_compatibility_flags = AV_RB32(rbsp_buf + 2);
                 /* revise these bits to get the profile compatibility value */
-                {
-                   uint32_t x = profile_compatibility_flags;
-                    x = ((x & 0x55555555U) << 1) | ((x >> 1) & 0x55555555U);
-                    x = ((x & 0x33333333U) << 2) | ((x >> 2) & 0x33333333U);
-                    x = ((x & 0x0F0F0F0FU) << 4) | ((x >> 4) & 0x0F0F0F0FU);
-                    x = ((x & 0x00FF00FFU) << 8) | ((x >> 8) & 0x00FF00FFU);
-                    profile_compatibility = (x << 16) | (x >> 16);
-                }
+                x = profile_compatibility_flags;
+                x = ((x & 0x55555555U) << 1) | ((x >> 1) & 0x55555555U);
+                x = ((x & 0x33333333U) << 2) | ((x >> 2) & 0x33333333U);
+                x = ((x & 0x0F0F0F0FU) << 4) | ((x >> 4) & 0x0F0F0F0FU);
+                x = ((x & 0x00FF00FFU) << 8) | ((x >> 8) & 0x00FF00FFU);
+                profile_compatibility = (x << 16) | (x >> 16);
                 /* skip 8 + 8 + 32
                  * CONSTRAINTS is a hexadecimal representation of the general_constraint_indicator_flags. 
                  * each byte is separated by a '.', and trailing zero bytes may be omitted.

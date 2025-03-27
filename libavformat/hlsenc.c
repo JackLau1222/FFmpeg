@@ -915,7 +915,7 @@ static int hls_mux_init(AVFormatContext *s, VariantStream *vs)
         }
         if (hls->max_seg_size > 0) {
             av_log(s, AV_LOG_WARNING, "Multi-file byterange mode is currently unsupported in the HLS muxer.\n");
-            return AVERROR_PATCHWELCOME;
+            //return AVERROR_PATCHWELCOME;
         }
     }
 
@@ -924,7 +924,7 @@ static int hls_mux_init(AVFormatContext *s, VariantStream *vs)
 
     if (hls->segment_type == SEGMENT_TYPE_FMP4) {
         set_http_options(s, &options, hls);
-        if (byterange_mode) {
+        if (byterange_mode && hls->flags & HLS_SINGLE_FILE) {
             ret = hlsenc_io_open(s, &vs->out, vs->basename, &options);
         } else {
             ret = hlsenc_io_open(s, &vs->out, vs->base_output_dirname, &options);
@@ -1672,7 +1672,7 @@ static int hls_window(AVFormatContext *s, int last, VariantStream *vs)
 
         if ((hls->segment_type == SEGMENT_TYPE_FMP4) && (en == vs->segments)) {
             ff_hls_write_init_file(byterange_mode ? hls->m3u8_out : vs->out, (hls->flags & HLS_SINGLE_FILE) ? en->filename : vs->fmp4_init_filename,
-                                   hls->flags & HLS_SINGLE_FILE, vs->init_range_length, 0);
+                                   byterange_mode, vs->init_range_length, 0);
         }
 
         ret = ff_hls_write_file_entry(byterange_mode ? hls->m3u8_out : vs->out, en->discont, byterange_mode,
@@ -2582,8 +2582,16 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
                 avio_open_dyn_buf(&oc->pb);
                 vs->packets_written = 0;
                 vs->start_pos = range_length;
-                if (!byterange_mode) {
+                if (!(hls->flags & HLS_SINGLE_FILE)) {
                     hlsenc_io_close(s, &vs->out, vs->base_output_dirname);
+                }
+                // read the first segment after writing init.mp4
+                if (byterange_mode && hls->max_seg_size > 0) {
+                    vs->start_pos = 0;
+                    av_write_frame(oc, NULL); /* Flush any buffered data */
+                    new_start_pos = avio_tell(oc->pb) + 24;/* first segment contains styp(24 bytes) */
+                    vs->size = new_start_pos;
+                    avio_flush(oc->pb);
                 }
             }
         }
@@ -2647,7 +2655,10 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
                     av_dict_free(&options);
                     return ret;
                 }
-                vs->size = range_length;
+                if (byterange_mode && hls->max_seg_size > 0)
+                    vs->size = range_length + 24 - vs->start_pos;/* styp -> 24 bytes */
+                else
+                    vs->size = range_length;
                 ret = hlsenc_io_close(s, &vs->out, filename);
                 if (ret < 0) {
                     av_log(s, AV_LOG_WARNING, "upload segment failed,"
@@ -2857,8 +2868,10 @@ static int hls_write_trailer(struct AVFormatContext *s)
         ret = flush_dynbuf(vs, &range_length);
         if (ret < 0)
             goto failed;
-
-        vs->size = range_length;
+        if (hls->segment_type = SEGMENT_TYPE_FMP4 && byterange_mode && hls->max_seg_size > 0)
+            vs->size = range_length + 24;/* styp -> 24 bytes */
+        else
+            vs->size = range_length;
         ret = hlsenc_io_close(s, &vs->out, filename);
         if (ret < 0) {
             av_log(s, AV_LOG_WARNING, "upload segment failed, will retry with a new http session.\n");

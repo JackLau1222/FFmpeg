@@ -644,8 +644,9 @@ av_cold int dtls_context_init(AVFormatContext *s, DTLSContext *ctx)
  * Once the DTLS role has been negotiated - active for the DTLS client or passive for the
  * DTLS server - we proceed to set up the DTLS state and initiate the handshake.
  */
-int dtls_context_start(DTLSContext *ctx)
+int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary **options)
 {
+    DTLSContext *ctx = h->priv_data;
     int ret = 0, r0, r1;
     SSL *dtls = ctx->dtls;
 
@@ -683,8 +684,9 @@ int dtls_context_start(DTLSContext *ctx)
  *
  * @return 0 if OK, AVERROR_xxx on error
  */
-int dtls_context_write(DTLSContext *ctx, char* buf, int size)
+int dtls_context_write(URLContext *h, char* buf, int size)
 {
+    DTLSContext *ctx = h->priv_data;
     int ret = 0, res_ct, res_ht, r0, r1, do_callback;
     SSL *dtls = ctx->dtls;
     const char* dst = "EXTRACTOR-dtls_srtp";
@@ -749,8 +751,9 @@ end:
 /**
  * Cleanup the DTLS context.
  */
-av_cold void dtls_context_deinit(DTLSContext *ctx)
+av_cold void dtls_context_deinit(URLContext *h)
 {
+    DTLSContext *ctx = h->priv_data;
     SSL_free(ctx->dtls);
     SSL_CTX_free(ctx->dtls_ctx);
     X509_free(ctx->dtls_cert);
@@ -763,26 +766,26 @@ av_cold void dtls_context_deinit(DTLSContext *ctx)
 #endif
 }
 
-// static const AVOption options[] = {
-//     { NULL }
-// };
+static const AVOption options[] = {
+    { NULL }
+};
 
-// static const AVClass dtls_class = {
-//     .class_name = "dtls",
-//     .item_name  = av_default_item_name,
-//     .option     = options,
-//     .version    = LIBAVUTIL_VERSION_INT,
-// };
+static const AVClass dtls_class = {
+    .class_name = "dtls",
+    .item_name  = av_default_item_name,
+    .option     = options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
 
-// const URLProtocol ff_tls_protocol = {
-//     .name           = "tls",
-//     .url_open2      = tls_open,
-//     // .url_read       = tls_read,
-//     .url_write      = dtls_context_write,
-//     .url_close      = dtls_context_deinit,
-//     // .url_get_file_handle = tls_get_file_handle,
-//     // .url_get_short_seek  = tls_get_short_seek,
-//     .priv_data_size = sizeof(DTLSContext),
-//     .flags          = URL_PROTOCOL_FLAG_NETWORK,
-//     .priv_data_class = &dtls_class,
-// };
+const URLProtocol ff_tls_protocol = {
+    .name           = "tls",
+    .url_open2      = dtls_context_start,
+    // .url_read       = tls_read,
+    .url_write      = dtls_context_write,
+    .url_close      = dtls_context_deinit,
+    // .url_get_file_handle = tls_get_file_handle,
+    // .url_get_short_seek  = tls_get_short_seek,
+    .priv_data_size = sizeof(DTLSContext),
+    .flags          = URL_PROTOCOL_FLAG_NETWORK,
+    .priv_data_class = &dtls_class,
+};

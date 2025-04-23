@@ -230,10 +230,10 @@ int is_dtls_packet(uint8_t *b, int size);
 
 av_cold int dtls_context_init(AVFormatContext *s, DTLSContext *ctx);
 
-int dtls_context_start(DTLSContext *ctx);
+int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary **options);
 
-int dtls_context_write(DTLSContext *ctx, char* buf, int size);
+int dtls_context_write(URLContext *h, char* buf, int size);
 
-av_cold void dtls_context_deinit(DTLSContext *ctx);
+av_cold void dtls_context_deinit(URLContext *h);
 
 #endif /* AVFORMAT_DTLS_H */

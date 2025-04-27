@@ -712,13 +712,15 @@ int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary *
  *
  * @return 0 if OK, AVERROR_xxx on error
  */
-int dtls_context_write(URLContext *h, const u_char* buf, int size)
+int dtls_context_write(URLContext *h, const uint8_t* buf, int size)
 {
     DTLSContext *ctx = h->priv_data;
     int ret = 0, res_ct, res_ht, r0, r1, do_callback;
     SSL *dtls = ctx->dtls;
     const char* dst = "EXTRACTOR-dtls_srtp";
     BIO *bio_in = ctx->bio_in;
+    static int num = 0;
+    printf("num: %d\n", ++num);
 
     /* Got DTLS response successfully. */
     openssl_dtls_state_trace(ctx, buf, size, 1);
@@ -809,6 +811,11 @@ static const AVClass dtls_class = {
     .option     = options,
     .version    = LIBAVUTIL_VERSION_INT,
 };
+
+static int dtls_context_tem_write(URLContext *h, const u_char* buf, int size)
+{
+    return 0;
+}
 
 const URLProtocol ff_dtls_protocol = {
     .name           = "dtls",

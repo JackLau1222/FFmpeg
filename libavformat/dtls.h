@@ -235,7 +235,7 @@ av_cold int dtls_context_init(AVFormatContext *s, DTLSContext *ctx);
 
 int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary **options);
 
-int dtls_context_write(URLContext *h, const u_char* buf, int size);
+int dtls_context_write(URLContext *h, const uint8_t* buf, int size);
 
 av_cold int dtls_context_deinit(URLContext *h);
 

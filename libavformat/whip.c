@@ -292,19 +292,19 @@ static av_cold int dtls_initialize(AVFormatContext *s)
     /* Use the same logging context as AV format. */
     DTLSContext *dtls_ctx = whip->dtls_uc->priv_data;
     dtls_ctx->av_class = whip->av_class;
-    dtls_ctx->mtu = whip->pkt_size;
+    // dtls_ctx->mtu = whip->pkt_size;
     dtls_ctx->opaque = s;
     dtls_ctx->on_state = dtls_context_on_state;
     dtls_ctx->on_write = dtls_context_on_write;
-    if (whip->cert_file)
-        dtls_ctx->cert_file = av_strdup(whip->cert_file);
-    if (whip->key_file)
-        dtls_ctx->key_file = av_strdup(whip->key_file);
+    // if (whip->cert_file)
+    //     dtls_ctx->cert_file = av_strdup(whip->cert_file);
+    // if (whip->key_file)
+    //     dtls_ctx->key_file = av_strdup(whip->key_file);
 
-    if ((ret = dtls_context_init(s, dtls_ctx)) < 0) {
-        av_log(whip, AV_LOG_ERROR, "WHIP: Failed to init DTLS context\n");
-        return ret;
-    }
+    // if ((ret = dtls_context_init(s, dtls_ctx)) < 0) {
+    //     av_log(whip, AV_LOG_ERROR, "WHIP: Failed to init DTLS context\n");
+    //     return ret;
+    // }
     return 0;
 }
 
@@ -1204,7 +1204,7 @@ next_packet:
                 //if ((ret = dtls_context_start(&whip->dtls_ctx)) < 0)
                 if (ret < 0)
                     goto end;
-                // dtls_initialize(s);
+                dtls_initialize(s);
             }
             goto next_packet;
         }
@@ -1218,8 +1218,8 @@ next_packet:
 
         /* If got any DTLS messages, handle it. */
         if (is_dtls_packet(whip->buf, ret) && whip->state >= WHIP_STATE_ICE_CONNECTED) {
-            //if ((ret = dtls_context_write(&whip->dtls_ctx, whip->buf, ret)) < 0)
-            if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0)
+            if ((ret = dtls_context_write(whip->dtls_uc, whip->buf, ret)) < 0)
+            // if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0)
                 goto end;
             goto next_packet;
         }
@@ -1682,8 +1682,8 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
     ret = ffurl_read(whip->udp_uc, whip->buf, sizeof(whip->buf));
     if (ret > 0) {
         if (is_dtls_packet(whip->buf, ret)) {
-            //if ((ret = dtls_context_write(&whip->dtls_ctx, whip->buf, ret)) < 0) {
-            if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0) {
+            if ((ret = dtls_context_write(whip->dtls_uc, whip->buf, ret)) < 0) {
+            // if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0) {
                 av_log(whip, AV_LOG_ERROR, "WHIP: Failed to handle DTLS message\n");
                 goto end;
             }

@@ -165,6 +165,9 @@ typedef struct DTLSContext {
     /* For callback. */
     DTLSContext_on_state_fn on_state;
     DTLSContext_on_write_fn on_write;
+
+    URLContext *udp_uc;
+
     void* opaque;
 
     /* For logging. */
@@ -232,8 +235,8 @@ av_cold int dtls_context_init(AVFormatContext *s, DTLSContext *ctx);
 
 int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary **options);
 
-int dtls_context_write(URLContext *h, char* buf, int size);
+int dtls_context_write(URLContext *h, const u_char* buf, int size);
 
-av_cold void dtls_context_deinit(URLContext *h);
+av_cold int dtls_context_deinit(URLContext *h);
 
 #endif /* AVFORMAT_DTLS_H */

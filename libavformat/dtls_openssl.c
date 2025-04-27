@@ -218,17 +218,31 @@ static int openssl_read_certificate(AVFormatContext *s, DTLSContext *ctx)
     int ret = 0;
     BIO *key_b = NULL, *cert_b = NULL;
     AVBPrint key_bp, cert_bp;
+    AVIOContext *ioc = NULL;
+
+    ret = avio_open(&ioc, ctx->key_file, AVIO_FLAG_READ);
+    if (ret < 0) {
+        // handle error...
+    }
 
     /* To prevent a crash during cleanup, always initialize it. */
     av_bprint_init(&key_bp, 1, MAX_CERTIFICATE_SIZE);
     av_bprint_init(&cert_bp, 1, MAX_CERTIFICATE_SIZE);
 
     /* Read key file. */
-    ret = url_read_all(s, ctx->key_file, &key_bp);
+    // Read up to SIZE_MAX bytes (i.e. until EOF)
+    ret = avio_read_to_bprint(ioc, &key_bp, SIZE_MAX);
+    avio_close(ioc);
     if (ret < 0) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to open key file %s\n", ctx->key_file);
+        av_bprint_finalize(&key_bp, NULL);
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to open cert file %s\n", ctx->cert_file);
         goto end;
     }
+    // ret = url_read_all(s, ctx->key_file, &key_bp);
+    // if (ret < 0) {
+    //     av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to open key file %s\n", ctx->key_file);
+    //     goto end;
+    // }
 
     if ((key_b = BIO_new(BIO_s_mem())) == NULL) {
         ret = AVERROR(ENOMEM);
@@ -244,11 +258,22 @@ static int openssl_read_certificate(AVFormatContext *s, DTLSContext *ctx)
     }
 
     /* Read certificate. */
-    ret = url_read_all(s, ctx->cert_file, &cert_bp);
+    ret = avio_open(&ioc, ctx->cert_file, AVIO_FLAG_READ);
     if (ret < 0) {
+        // handle error...
+    }
+    ret = avio_read_to_bprint(ioc, &cert_bp, SIZE_MAX);
+    avio_close(ioc);
+    if (ret < 0) {
+        av_bprint_finalize(&cert_bp, NULL);
         av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to open cert file %s\n", ctx->cert_file);
         goto end;
     }
+    // ret = url_read_all(s, ctx->cert_file, &cert_bp);
+    // if (ret < 0) {
+    //     av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to open cert file %s\n", ctx->cert_file);
+    //     goto end;
+    // }
 
     if ((cert_b = BIO_new(BIO_s_mem())) == NULL) {
         ret = AVERROR(ENOMEM);
@@ -405,7 +430,7 @@ static int openssl_dtls_gen_certificate(DTLSContext *ctx)
         goto einval_end;
     }
 
-    /* Generate the fingerpint of certficate. */
+    /* Generate the fingerpint of certificate. */
     if (X509_digest(dtls_cert, EVP_sha256(), md, &n) != 1) {
         av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to generate fingerprint, %s\n", openssl_get_error(ctx));
         goto eio_end;
@@ -648,7 +673,10 @@ int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary *
 {
     DTLSContext *ctx = h->priv_data;
     int ret = 0, r0, r1;
-    SSL *dtls = ctx->dtls;
+    SSL *dtls = NULL;
+
+    dtls_context_init(NULL, ctx);
+    dtls = ctx->dtls;
 
     ctx->dtls_handshake_starttime = av_gettime();
 
@@ -684,7 +712,7 @@ int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary *
  *
  * @return 0 if OK, AVERROR_xxx on error
  */
-int dtls_context_write(URLContext *h, char* buf, int size)
+int dtls_context_write(URLContext *h, const u_char* buf, int size)
 {
     DTLSContext *ctx = h->priv_data;
     int ret = 0, res_ct, res_ht, r0, r1, do_callback;
@@ -751,7 +779,7 @@ end:
 /**
  * Cleanup the DTLS context.
  */
-av_cold void dtls_context_deinit(URLContext *h)
+av_cold int dtls_context_deinit(URLContext *h)
 {
     DTLSContext *ctx = h->priv_data;
     SSL_free(ctx->dtls);
@@ -764,9 +792,14 @@ av_cold void dtls_context_deinit(URLContext *h)
 #if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
     EC_KEY_free(ctx->dtls_eckey);
 #endif
+    return 0;
 }
 
+#define OFFSET(x) offsetof(DTLSContext, x)
 static const AVOption options[] = {
+    { "mtu", "Maximum Transmission Unit", OFFSET(mtu), AV_OPT_TYPE_INT, { .i64 = -1}, -1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
+    { "cert_file", "The optional certificate file path for DTLS", OFFSET(cert_file), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
+    { "key_file", "The optional private key file path for DTLS", OFFSET(key_file), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
     { NULL }
 };
 
@@ -777,8 +810,8 @@ static const AVClass dtls_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const URLProtocol ff_tls_protocol = {
-    .name           = "tls",
+const URLProtocol ff_dtls_protocol = {
+    .name           = "dtls",
     .url_open2      = dtls_context_start,
     // .url_read       = tls_read,
     .url_write      = dtls_context_write,

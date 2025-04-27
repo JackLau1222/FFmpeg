@@ -199,7 +199,9 @@ typedef struct WHIPContext {
     int64_t whip_srtp_time;
 
     /* The DTLS context. */
-    DTLSContext dtls_ctx;
+    //DTLSContext dtls_ctx;
+    /* TODO: Use AVIOContext instead of URLContext */
+    URLContext *dtls_uc;
 
     /* The SRTP send context, to encrypt outgoing packets. */
     SRTPContext srtp_audio_send;
@@ -283,6 +285,29 @@ static int dtls_context_on_write(DTLSContext *ctx, char* data, int size)
     return ffurl_write(whip->udp_uc, data, size);
 }
 
+static av_cold int dtls_initialize(AVFormatContext *s)
+{
+    int ret;
+    WHIPContext *whip = s->priv_data;
+    /* Use the same logging context as AV format. */
+    DTLSContext *dtls_ctx = whip->dtls_uc->priv_data;
+    dtls_ctx->av_class = whip->av_class;
+    dtls_ctx->mtu = whip->pkt_size;
+    dtls_ctx->opaque = s;
+    dtls_ctx->on_state = dtls_context_on_state;
+    dtls_ctx->on_write = dtls_context_on_write;
+    if (whip->cert_file)
+        dtls_ctx->cert_file = av_strdup(whip->cert_file);
+    if (whip->key_file)
+        dtls_ctx->key_file = av_strdup(whip->key_file);
+
+    if ((ret = dtls_context_init(s, dtls_ctx)) < 0) {
+        av_log(whip, AV_LOG_ERROR, "WHIP: Failed to init DTLS context\n");
+        return ret;
+    }
+    return 0;
+}
+
 /**
  * Initialize and check the options for the WebRTC muxer.
  */
@@ -297,22 +322,6 @@ static av_cold int initialize(AVFormatContext *s)
     /* Initialize the random number generator. */
     seed = av_get_random_seed();
     av_lfg_init(&whip->rnd, seed);
-
-    /* Use the same logging context as AV format. */
-    whip->dtls_ctx.av_class = whip->av_class;
-    whip->dtls_ctx.mtu = whip->pkt_size;
-    whip->dtls_ctx.opaque = s;
-    whip->dtls_ctx.on_state = dtls_context_on_state;
-    whip->dtls_ctx.on_write = dtls_context_on_write;
-    if (whip->cert_file)
-        whip->dtls_ctx.cert_file = av_strdup(whip->cert_file);
-    if (whip->key_file)
-        whip->dtls_ctx.key_file = av_strdup(whip->key_file);
-
-    if ((ret = dtls_context_init(s, &whip->dtls_ctx)) < 0) {
-        av_log(whip, AV_LOG_ERROR, "WHIP: Failed to init DTLS context\n");
-        return ret;
-    }
 
     if (whip->pkt_size < ideal_pkt_size)
         av_log(whip, AV_LOG_WARNING, "WHIP: pkt_size=%d(<%d) is too small, may cause packet loss\n",
@@ -495,6 +504,7 @@ static int generate_sdp_offer(AVFormatContext *s)
     const char *acodec_name = NULL, *vcodec_name = NULL;
     AVBPrint bp;
     WHIPContext *whip = s->priv_data;
+    // DTLSContext *dtls_ctx = whip->dtls_uc->priv_data;
 
     /* To prevent a crash during cleanup, always initialize it. */
     av_bprint_init(&bp, 1, MAX_SDP_SIZE);
@@ -549,7 +559,8 @@ static int generate_sdp_offer(AVFormatContext *s)
             whip->audio_payload_type,
             whip->ice_ufrag_local,
             whip->ice_pwd_local,
-            whip->dtls_ctx.dtls_fingerprint,
+            // dtls_ctx->dtls_fingerprint,
+            NULL,
             whip->audio_payload_type,
             acodec_name,
             whip->audio_par->sample_rate,
@@ -586,7 +597,8 @@ static int generate_sdp_offer(AVFormatContext *s)
             whip->video_payload_type,
             whip->ice_ufrag_local,
             whip->ice_pwd_local,
-            whip->dtls_ctx.dtls_fingerprint,
+            // dtls_ctx->dtls_fingerprint,
+            NULL,
             whip->video_payload_type,
             vcodec_name,
             whip->video_payload_type,
@@ -1114,6 +1126,9 @@ static int ice_dtls_handshake(AVFormatContext *s)
     int ret = 0, size, i;
     int64_t starttime = av_gettime(), now;
     WHIPContext *whip = s->priv_data;
+    AVDictionary *opts = NULL;
+    char str[8];
+    char buf[256];
 
     if (whip->state < WHIP_STATE_UDP_CONNECTED || !whip->udp_uc) {
         av_log(whip, AV_LOG_ERROR, "WHIP: UDP not connected, state=%d, udp_uc=%p\n", whip->state, whip->udp_uc);
@@ -1178,9 +1193,18 @@ next_packet:
                     whip->state, whip->ice_host, whip->ice_port, whip->whip_resource_url ? whip->whip_resource_url : "",
                     whip->ice_ufrag_remote, whip->ice_ufrag_local, ret, ELAPSED(whip->whip_starttime, av_gettime()));
 
+                ff_url_join(buf, sizeof(buf), "dtls", NULL, whip->ice_host, whip->ice_port, NULL);
+                sprintf(str, "%d", whip->pkt_size);
+                av_dict_set(&opts, "mtu", str, 0);
+                av_dict_set(&opts, "key_file", whip->key_file, 0);
+                av_dict_set(&opts, "cert_file", whip->cert_file, 0);
+                ret = ffurl_open_whitelist(&whip->dtls_uc, buf, AVIO_FLAG_WRITE, &s->interrupt_callback,
+                    &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
                 /* If got the first binding response, start DTLS handshake. */
-                if ((ret = dtls_context_start(&whip->dtls_ctx)) < 0)
+                //if ((ret = dtls_context_start(&whip->dtls_ctx)) < 0)
+                if (ret < 0)
                     goto end;
+                // dtls_initialize(s);
             }
             goto next_packet;
         }
@@ -1194,7 +1218,8 @@ next_packet:
 
         /* If got any DTLS messages, handle it. */
         if (is_dtls_packet(whip->buf, ret) && whip->state >= WHIP_STATE_ICE_CONNECTED) {
-            if ((ret = dtls_context_write(&whip->dtls_ctx, whip->buf, ret)) < 0)
+            //if ((ret = dtls_context_write(&whip->dtls_ctx, whip->buf, ret)) < 0)
+            if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0)
                 goto end;
             goto next_packet;
         }
@@ -1225,6 +1250,7 @@ static int setup_srtp(AVFormatContext *s)
      */
     const char* suite = "SRTP_AES128_CM_HMAC_SHA1_80";
     WHIPContext *whip = s->priv_data;
+    DTLSContext *dtls_ctx = whip->dtls_uc->priv_data;
 
     /**
      * This represents the material used to build the SRTP master key. It is
@@ -1232,8 +1258,8 @@ static int setup_srtp(AVFormatContext *s)
      *          16B         16B         14B             14B
      *      client_key | server_key | client_salt | server_salt
      */
-    char *client_key = whip->dtls_ctx.dtls_srtp_materials;
-    char *server_key = whip->dtls_ctx.dtls_srtp_materials + DTLS_SRTP_KEY_LEN;
+    char *client_key = dtls_ctx->dtls_srtp_materials;
+    char *server_key = dtls_ctx->dtls_srtp_materials + DTLS_SRTP_KEY_LEN;
     char *client_salt = server_key + DTLS_SRTP_KEY_LEN;
     char *server_salt = client_salt + DTLS_SRTP_SALT_LEN;
 
@@ -1656,7 +1682,8 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
     ret = ffurl_read(whip->udp_uc, whip->buf, sizeof(whip->buf));
     if (ret > 0) {
         if (is_dtls_packet(whip->buf, ret)) {
-            if ((ret = dtls_context_write(&whip->dtls_ctx, whip->buf, ret)) < 0) {
+            //if ((ret = dtls_context_write(&whip->dtls_ctx, whip->buf, ret)) < 0) {
+            if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0) {
                 av_log(whip, AV_LOG_ERROR, "WHIP: Failed to handle DTLS message\n");
                 goto end;
             }
@@ -1734,7 +1761,8 @@ static av_cold void whip_deinit(AVFormatContext *s)
     ff_srtp_free(&whip->srtp_video_send);
     ff_srtp_free(&whip->srtp_rtcp_send);
     ff_srtp_free(&whip->srtp_recv);
-    dtls_context_deinit(&whip->dtls_ctx);
+    //dtls_context_deinit(&whip->dtls_ctx);
+    ffurl_close(whip->dtls_uc);
 }
 
 static int whip_check_bitstream(AVFormatContext *s, AVStream *st, const AVPacket *pkt)

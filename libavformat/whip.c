@@ -1218,8 +1218,8 @@ next_packet:
 
         /* If got any DTLS messages, handle it. */
         if (is_dtls_packet(whip->buf, ret) && whip->state >= WHIP_STATE_ICE_CONNECTED) {
-            if ((ret = dtls_context_write(whip->dtls_uc, whip->buf, ret)) < 0)
-            // if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0)
+            // if ((ret = dtls_context_write(whip->dtls_uc, whip->buf, ret)) < 0)
+            if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0)
                 goto end;
             goto next_packet;
         }
@@ -1682,8 +1682,8 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
     ret = ffurl_read(whip->udp_uc, whip->buf, sizeof(whip->buf));
     if (ret > 0) {
         if (is_dtls_packet(whip->buf, ret)) {
-            if ((ret = dtls_context_write(whip->dtls_uc, whip->buf, ret)) < 0) {
-            // if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0) {
+            // if ((ret = dtls_context_write(whip->dtls_uc, whip->buf, ret)) < 0) {
+            if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0) {
                 av_log(whip, AV_LOG_ERROR, "WHIP: Failed to handle DTLS message\n");
                 goto end;
             }

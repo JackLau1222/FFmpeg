@@ -730,7 +730,7 @@ int dtls_context_write(URLContext *h, const uint8_t* buf, int size)
         av_log(ctx, AV_LOG_ERROR, "DTLS: Feed response failed, content=%d, handshake=%d, size=%d, r0=%d\n",
             res_ct, res_ht, size, r0);
         ret = AVERROR(EIO);
-        goto end;
+        goto error;
     }
 
     /**
@@ -743,7 +743,7 @@ int dtls_context_write(URLContext *h, const uint8_t* buf, int size)
         if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
             av_log(ctx, AV_LOG_ERROR, "DTLS: Read failed, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
             ret = AVERROR(EIO);
-            goto end;
+            goto error;
         }
     } else {
         av_log(ctx, AV_LOG_TRACE, "DTLS: Read %d bytes, r0=%d, r1=%d\n", r0, r0, r1);
@@ -765,7 +765,7 @@ int dtls_context_write(URLContext *h, const uint8_t* buf, int size)
         if (!ret) {
             av_log(ctx, AV_LOG_ERROR, "DTLS: SSL export key ret=%d, r1=%d %s\n", ret, r1, ctx->error_message);
             ret = AVERROR(EIO);
-            goto end;
+            goto error;
         }
 
         ctx->dtls_srtp_key_exported = 1;
@@ -774,8 +774,10 @@ int dtls_context_write(URLContext *h, const uint8_t* buf, int size)
     if (do_callback && (ret = ctx->on_state(ctx, DTLS_STATE_FINISHED, NULL, NULL)) < 0)
         goto end;
 
+error:
+    //return ret;
 end:
-    return ret;
+    return size;
 }
 
 /**

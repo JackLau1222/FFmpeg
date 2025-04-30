@@ -103,8 +103,10 @@ static int url_read_all(AVFormatContext *s, const char *url, AVBPrint *bp)
     URLContext *uc = NULL;
     char buf[MAX_URL_SIZE];
 
-    ret = ffurl_open_whitelist(&uc, url, AVIO_FLAG_READ, &s->interrupt_callback,
-        &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
+    // ret = ffurl_open_whitelist(&uc, url, AVIO_FLAG_READ, &s->interrupt_callback,
+    //     &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
+    ret = ffurl_open_whitelist(&uc, url, AVIO_FLAG_READ, NULL,
+        &opts, NULL, NULL, NULL);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "WHIP: Failed to open url %s\n", url);
         goto end;
@@ -231,12 +233,12 @@ typedef struct DTLSContext {
 
 int is_dtls_packet(uint8_t *b, int size);
 
-av_cold int dtls_context_init(AVFormatContext *s, DTLSContext *ctx);
+// av_cold int dtls_context_init(AVFormatContext *s, DTLSContext *ctx);
 
-int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary **options);
+// int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary **options);
 
-int dtls_context_write(URLContext *h, const uint8_t* buf, int size);
+// int dtls_context_write(URLContext *h, const uint8_t* buf, int size);
 
-av_cold int dtls_context_deinit(URLContext *h);
+// av_cold int dtls_context_deinit(URLContext *h);
 
 #endif /* AVFORMAT_DTLS_H */

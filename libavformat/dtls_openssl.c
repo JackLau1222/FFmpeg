@@ -213,6 +213,56 @@ static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp,
     return retvalue;
 }
 
+/**
+ * Generate a SHA-256 fingerprint of an X.509 certificate.
+ *
+ * @param ctx       AVFormatContext for logging (can be NULL)
+ * @param cert      X509 certificate to fingerprint
+ * @return          Newly allocated fingerprint string in "AA:BB:CC:…" format,
+ *                  or NULL on error (logs via av_log if ctx != NULL).
+ *                  Caller must free() the returned string.
+ */
+static char *generate_dtls_fingerprint(DTLSContext *ctx, X509 *cert)
+{
+    unsigned char md[EVP_MAX_MD_SIZE];
+    int n = 0;
+    AVBPrint fingerprint;
+    char *result = NULL;
+    int i;
+    
+    /* To prevent a crash during cleanup, always initialize it. */
+    av_bprint_init(&fingerprint, 0, AV_BPRINT_SIZE_UNLIMITED);
+
+    if (X509_digest(cert, EVP_sha256(), md, &n) != 1) {
+        if (ctx)
+            av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to generate fingerprint, %s\n",
+                   openssl_get_error(ctx));
+        goto end;
+    }
+
+    for (i = 0; i < n; i++) {
+        av_bprintf(&fingerprint, "%02X", md[i]);
+        if (i + 1 < n)
+            av_bprintf(&fingerprint, ":");
+    }
+
+    if (!fingerprint.str || !strlen(fingerprint.str)) {
+        if (ctx)
+            av_log(ctx, AV_LOG_ERROR, "DTLS: Fingerprint is empty\n");
+        goto end;
+    }
+
+    result = av_strdup(fingerprint.str);
+    if (!result) {
+        if (ctx)
+            av_log(ctx, AV_LOG_ERROR, "DTLS: Out of memory generating fingerprint\n");
+    }
+
+end:
+    av_bprint_finalize(&fingerprint, NULL);
+    return result;
+}
+
 static int openssl_read_certificate(AVFormatContext *s, DTLSContext *ctx)
 {
     int ret = 0;
@@ -220,29 +270,17 @@ static int openssl_read_certificate(AVFormatContext *s, DTLSContext *ctx)
     AVBPrint key_bp, cert_bp;
     AVIOContext *ioc = NULL;
 
-    ret = avio_open(&ioc, ctx->key_file, AVIO_FLAG_READ);
-    if (ret < 0) {
-        // handle error...
-    }
 
     /* To prevent a crash during cleanup, always initialize it. */
     av_bprint_init(&key_bp, 1, MAX_CERTIFICATE_SIZE);
     av_bprint_init(&cert_bp, 1, MAX_CERTIFICATE_SIZE);
 
     /* Read key file. */
-    // Read up to SIZE_MAX bytes (i.e. until EOF)
-    ret = avio_read_to_bprint(ioc, &key_bp, SIZE_MAX);
-    avio_close(ioc);
+    ret = url_read_all(s, ctx->key_file, &key_bp);
     if (ret < 0) {
-        av_bprint_finalize(&key_bp, NULL);
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to open cert file %s\n", ctx->cert_file);
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to open key file %s\n", ctx->key_file);
         goto end;
     }
-    // ret = url_read_all(s, ctx->key_file, &key_bp);
-    // if (ret < 0) {
-    //     av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to open key file %s\n", ctx->key_file);
-    //     goto end;
-    // }
 
     if ((key_b = BIO_new(BIO_s_mem())) == NULL) {
         ret = AVERROR(ENOMEM);
@@ -258,22 +296,11 @@ static int openssl_read_certificate(AVFormatContext *s, DTLSContext *ctx)
     }
 
     /* Read certificate. */
-    ret = avio_open(&ioc, ctx->cert_file, AVIO_FLAG_READ);
+    ret = url_read_all(s, ctx->cert_file, &cert_bp);
     if (ret < 0) {
-        // handle error...
-    }
-    ret = avio_read_to_bprint(ioc, &cert_bp, SIZE_MAX);
-    avio_close(ioc);
-    if (ret < 0) {
-        av_bprint_finalize(&cert_bp, NULL);
         av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to open cert file %s\n", ctx->cert_file);
         goto end;
     }
-    // ret = url_read_all(s, ctx->cert_file, &cert_bp);
-    // if (ret < 0) {
-    //     av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to open cert file %s\n", ctx->cert_file);
-    //     goto end;
-    // }
 
     if ((cert_b = BIO_new(BIO_s_mem())) == NULL) {
         ret = AVERROR(ENOMEM);
@@ -284,6 +311,14 @@ static int openssl_read_certificate(AVFormatContext *s, DTLSContext *ctx)
     ctx->dtls_cert = PEM_read_bio_X509(cert_b, NULL, NULL, NULL);
     if (!ctx->dtls_cert) {
         av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to read certificate from %s\n", ctx->cert_file);
+        ret = AVERROR(EIO);
+        goto end;
+    }
+
+    /* Generate fingerprint. */
+    ctx->dtls_fingerprint = generate_dtls_fingerprint(ctx, ctx->dtls_cert);
+    if (!ctx->dtls_fingerprint) {
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to generate fingerprint from %s\n", ctx->cert_file);
         ret = AVERROR(EIO);
         goto end;
     }
@@ -365,14 +400,9 @@ end:
 static int openssl_dtls_gen_certificate(DTLSContext *ctx)
 {
     int ret = 0, serial, expire_day, i, n = 0;
-    AVBPrint fingerprint;
-    unsigned char md[EVP_MAX_MD_SIZE];
     const char *aor = "lavf";
     X509_NAME* subject = NULL;
     X509 *dtls_cert = NULL;
-
-    /* To prevent a crash during cleanup, always initialize it. */
-    av_bprint_init(&fingerprint, 1, MAX_URL_SIZE);
 
     dtls_cert = ctx->dtls_cert = X509_new();
     if (!dtls_cert) {
@@ -430,22 +460,7 @@ static int openssl_dtls_gen_certificate(DTLSContext *ctx)
         goto einval_end;
     }
 
-    /* Generate the fingerpint of certificate. */
-    if (X509_digest(dtls_cert, EVP_sha256(), md, &n) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to generate fingerprint, %s\n", openssl_get_error(ctx));
-        goto eio_end;
-    }
-    for (i = 0; i < n; i++) {
-        av_bprintf(&fingerprint, "%02X", md[i]);
-        if (i < n - 1)
-            av_bprintf(&fingerprint, ":");
-    }
-    if (!fingerprint.str || !strlen(fingerprint.str)) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Fingerprint is empty\n");
-        goto einval_end;
-    }
-
-    ctx->dtls_fingerprint = av_strdup(fingerprint.str);
+    ctx->dtls_fingerprint = generate_dtls_fingerprint(ctx, dtls_cert);
     if (!ctx->dtls_fingerprint) {
         goto enomem_end;
     }
@@ -461,7 +476,7 @@ einval_end:
     ret = AVERROR(EINVAL);
 end:
     X509_NAME_free(subject);
-    av_bprint_finalize(&fingerprint, NULL);
+    //av_bprint_finalize(&fingerprint, NULL);
     return ret;
 }
 
@@ -626,7 +641,7 @@ end:
  * ff_openssl_init in tls_openssl.c has already called SSL_library_init(), and therefore,
  * there is no need to call it again.
  */
-av_cold int dtls_context_init(AVFormatContext *s, DTLSContext *ctx)
+static av_cold int dtls_context_init(AVFormatContext *s, DTLSContext *ctx)
 {
     int ret = 0;
 
@@ -669,7 +684,7 @@ av_cold int dtls_context_init(AVFormatContext *s, DTLSContext *ctx)
  * Once the DTLS role has been negotiated - active for the DTLS client or passive for the
  * DTLS server - we proceed to set up the DTLS state and initiate the handshake.
  */
-int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary **options)
+static int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary **options)
 {
     DTLSContext *ctx = h->priv_data;
     int ret = 0, r0, r1;
@@ -712,7 +727,7 @@ int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary *
  *
  * @return 0 if OK, AVERROR_xxx on error
  */
-int dtls_context_write(URLContext *h, const uint8_t* buf, int size)
+static int dtls_context_write(URLContext *h, const uint8_t* buf, int size)
 {
     DTLSContext *ctx = h->priv_data;
     int ret = 0, res_ct, res_ht, r0, r1, do_callback;
@@ -783,7 +798,7 @@ end:
 /**
  * Cleanup the DTLS context.
  */
-av_cold int dtls_context_deinit(URLContext *h)
+static av_cold int dtls_context_deinit(URLContext *h)
 {
     DTLSContext *ctx = h->priv_data;
     SSL_free(ctx->dtls);

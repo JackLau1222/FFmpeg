@@ -93,51 +93,6 @@
 /* Calculate the elapsed time from starttime to endtime in milliseconds. */
 #define ELAPSED(starttime, endtime) ((int)(endtime - starttime) / 1000)
 
-/**
- * Read all data from the given URL url and store it in the given buffer bp.
- */
-static int url_read_all(AVFormatContext *s, const char *url, AVBPrint *bp)
-{
-    int ret = 0;
-    AVDictionary *opts = NULL;
-    URLContext *uc = NULL;
-    char buf[MAX_URL_SIZE];
-
-    // ret = ffurl_open_whitelist(&uc, url, AVIO_FLAG_READ, &s->interrupt_callback,
-    //     &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
-    ret = ffurl_open_whitelist(&uc, url, AVIO_FLAG_READ, NULL,
-        &opts, NULL, NULL, NULL);
-    if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "WHIP: Failed to open url %s\n", url);
-        goto end;
-    }
-
-    while (1) {
-        ret = ffurl_read(uc, buf, sizeof(buf));
-        if (ret == AVERROR_EOF) {
-            /* Reset the error because we read all response as answer util EOF. */
-            ret = 0;
-            break;
-        }
-        if (ret <= 0) {
-            av_log(s, AV_LOG_ERROR, "WHIP: Failed to read from url=%s, key is %s\n", url, bp->str);
-            goto end;
-        }
-
-        av_bprintf(bp, "%.*s", ret, buf);
-        if (!av_bprint_is_complete(bp)) {
-            av_log(s, AV_LOG_ERROR, "WHIP: Exceed max size %.*s, %s\n", ret, buf, bp->str);
-            ret = AVERROR(EIO);
-            goto end;
-        }
-    }
-
-end:
-    ffurl_closep(&uc);
-    av_dict_free(&opts);
-    return ret;
-}
-
 /* STUN Attribute, comprehension-required range (0x0000-0x7FFF) */
 enum STUNAttr {
     STUN_ATTR_USERNAME                  = 0x0006, /// shared secret response/bind request
@@ -221,9 +176,9 @@ typedef struct DTLSContext {
     int error_code;
     char error_message[256];
 
-    /* The certificate and private key used for DTLS handshake. */
-    char* cert_file;
-    char* key_file;
+    /* The certificate and private key content used for DTLS hanshake */
+    char* cert_buf;
+    char* key_buf;
     /**
      * The size of RTP packet, should generally be set to MTU.
      * Note that pion requires a smaller value, for example, 1200.

@@ -29,6 +29,62 @@
 #include "mux.h"
 #include "srtp.h"
 
+/**
+ * Deserialize a PEM‐encoded private or public key from a NUL-terminated C string.
+ *
+ * @param pem_str   The PEM text, e.g.
+ *                  "-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----\n"
+ * @param is_priv   If non-zero, parse as a PRIVATE key; otherwise, parse as a PUBLIC key.
+ * @return          EVP_PKEY* on success (must EVP_PKEY_free()), or NULL on error.
+ */
+static EVP_PKEY *pkey_from_pem_string(const char *pem_str, int is_priv)
+{
+    BIO *mem = BIO_new_mem_buf(pem_str, -1);
+    if (!mem) {
+        fprintf(stderr, "BIO_new_mem_buf failed\n");
+        return NULL;
+    }
+
+    EVP_PKEY *pkey = NULL;
+    if (is_priv) {
+        pkey = PEM_read_bio_PrivateKey(mem, NULL, NULL, NULL);
+    } else {
+        pkey = PEM_read_bio_PUBKEY(mem, NULL, NULL, NULL);
+    }
+
+    if (!pkey) {
+        fprintf(stderr, "Failed to parse %s key from string\n",
+                is_priv ? "private" : "public");
+    }
+
+    BIO_free(mem);
+    return pkey;
+}
+
+/**
+ * Deserialize a PEM‐encoded certificate from a NUL-terminated C string.
+ *
+ * @param pem_str   The PEM text, e.g.
+ *                  "-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----\n"
+ * @return          X509* on success (must X509_free()), or NULL on error.
+ */
+static X509 *cert_from_pem_string(const char *pem_str)
+{
+    BIO *mem = BIO_new_mem_buf(pem_str, -1);
+    if (!mem) {
+        fprintf(stderr, "BIO_new_mem_buf failed\n");
+        return NULL;
+    }
+
+    X509 *cert = PEM_read_bio_X509(mem, NULL, NULL, NULL);
+    if (!cert) {
+        fprintf(stderr, "Failed to parse certificate from string\n");
+    }
+
+    BIO_free(mem);
+    return cert;
+}
+
 
 
 /**
@@ -214,273 +270,6 @@ static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp,
 }
 
 /**
- * Generate a SHA-256 fingerprint of an X.509 certificate.
- *
- * @param ctx       AVFormatContext for logging (can be NULL)
- * @param cert      X509 certificate to fingerprint
- * @return          Newly allocated fingerprint string in "AA:BB:CC:…" format,
- *                  or NULL on error (logs via av_log if ctx != NULL).
- *                  Caller must free() the returned string.
- */
-static char *generate_dtls_fingerprint(DTLSContext *ctx, X509 *cert)
-{
-    unsigned char md[EVP_MAX_MD_SIZE];
-    int n = 0;
-    AVBPrint fingerprint;
-    char *result = NULL;
-    int i;
-    
-    /* To prevent a crash during cleanup, always initialize it. */
-    av_bprint_init(&fingerprint, 0, AV_BPRINT_SIZE_UNLIMITED);
-
-    if (X509_digest(cert, EVP_sha256(), md, &n) != 1) {
-        if (ctx)
-            av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to generate fingerprint, %s\n",
-                   openssl_get_error(ctx));
-        goto end;
-    }
-
-    for (i = 0; i < n; i++) {
-        av_bprintf(&fingerprint, "%02X", md[i]);
-        if (i + 1 < n)
-            av_bprintf(&fingerprint, ":");
-    }
-
-    if (!fingerprint.str || !strlen(fingerprint.str)) {
-        if (ctx)
-            av_log(ctx, AV_LOG_ERROR, "DTLS: Fingerprint is empty\n");
-        goto end;
-    }
-
-    result = av_strdup(fingerprint.str);
-    if (!result) {
-        if (ctx)
-            av_log(ctx, AV_LOG_ERROR, "DTLS: Out of memory generating fingerprint\n");
-    }
-
-end:
-    av_bprint_finalize(&fingerprint, NULL);
-    return result;
-}
-
-static int openssl_read_certificate(AVFormatContext *s, DTLSContext *ctx)
-{
-    int ret = 0;
-    BIO *key_b = NULL, *cert_b = NULL;
-    AVBPrint key_bp, cert_bp;
-    AVIOContext *ioc = NULL;
-
-
-    /* To prevent a crash during cleanup, always initialize it. */
-    av_bprint_init(&key_bp, 1, MAX_CERTIFICATE_SIZE);
-    av_bprint_init(&cert_bp, 1, MAX_CERTIFICATE_SIZE);
-
-    /* Read key file. */
-    ret = url_read_all(s, ctx->key_file, &key_bp);
-    if (ret < 0) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to open key file %s\n", ctx->key_file);
-        goto end;
-    }
-
-    if ((key_b = BIO_new(BIO_s_mem())) == NULL) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-
-    BIO_write(key_b, key_bp.str, key_bp.len);
-    ctx->dtls_pkey = PEM_read_bio_PrivateKey(key_b, NULL, NULL, NULL);
-    if (!ctx->dtls_pkey) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to read private key from %s\n", ctx->key_file);
-        ret = AVERROR(EIO);
-        goto end;
-    }
-
-    /* Read certificate. */
-    ret = url_read_all(s, ctx->cert_file, &cert_bp);
-    if (ret < 0) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to open cert file %s\n", ctx->cert_file);
-        goto end;
-    }
-
-    if ((cert_b = BIO_new(BIO_s_mem())) == NULL) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-
-    BIO_write(cert_b, cert_bp.str, cert_bp.len);
-    ctx->dtls_cert = PEM_read_bio_X509(cert_b, NULL, NULL, NULL);
-    if (!ctx->dtls_cert) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to read certificate from %s\n", ctx->cert_file);
-        ret = AVERROR(EIO);
-        goto end;
-    }
-
-    /* Generate fingerprint. */
-    ctx->dtls_fingerprint = generate_dtls_fingerprint(ctx, ctx->dtls_cert);
-    if (!ctx->dtls_fingerprint) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to generate fingerprint from %s\n", ctx->cert_file);
-        ret = AVERROR(EIO);
-        goto end;
-    }
-
-end:
-    BIO_free(key_b);
-    av_bprint_finalize(&key_bp, NULL);
-    BIO_free(cert_b);
-    av_bprint_finalize(&cert_bp, NULL);
-    return ret;
-}
-
-static int openssl_dtls_gen_private_key(DTLSContext *ctx)
-{
-    int ret = 0;
-
-    /**
-     * Note that secp256r1 in openssl is called NID_X9_62_prime256v1 or prime256v1 in string,
-     * not NID_secp256k1 or secp256k1 in string.
-     *
-     * TODO: Should choose the curves in ClientHello.supported_groups, for example:
-     *      Supported Group: x25519 (0x001d)
-     *      Supported Group: secp256r1 (0x0017)
-     *      Supported Group: secp384r1 (0x0018)
-     */
-#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
-    EC_GROUP *ecgroup = NULL;
-    int curve = NID_X9_62_prime256v1;
-#else
-    const char *curve = SN_X9_62_prime256v1;
-#endif
-
-#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
-    ctx->dtls_pkey = EVP_PKEY_new();
-    ctx->dtls_eckey = EC_KEY_new();
-    ecgroup = EC_GROUP_new_by_curve_name(curve);
-    if (!ecgroup) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Create EC group by curve=%d failed, %s", curve, openssl_get_error(ctx));
-        goto einval_end;
-    }
-
-#if OPENSSL_VERSION_NUMBER < 0x10100000L // v1.1.x
-    /* For openssl 1.0, we must set the group parameters, so that cert is ok. */
-    EC_GROUP_set_asn1_flag(ecgroup, OPENSSL_EC_NAMED_CURVE);
-#endif
-
-    if (EC_KEY_set_group(ctx->dtls_eckey, ecgroup) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Generate private key, EC_KEY_set_group failed, %s\n", openssl_get_error(ctx));
-        goto einval_end;
-    }
-
-    if (EC_KEY_generate_key(ctx->dtls_eckey) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Generate private key, EC_KEY_generate_key failed, %s\n", openssl_get_error(ctx));
-        goto einval_end;
-    }
-
-    if (EVP_PKEY_set1_EC_KEY(ctx->dtls_pkey, ctx->dtls_eckey) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Generate private key, EVP_PKEY_set1_EC_KEY failed, %s\n", openssl_get_error(ctx));
-        goto einval_end;
-    }
-#else
-    ctx->dtls_pkey = EVP_EC_gen(curve);
-    if (!ctx->dtls_pkey) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Generate private key, EVP_EC_gen curve=%s failed, %s\n", curve, openssl_get_error(ctx));
-        goto einval_end;
-    }
-#endif
-    goto end;
-
-einval_end:
-    ret = AVERROR(EINVAL);
-end:
-#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
-    EC_GROUP_free(ecgroup);
-#endif
-    return ret;
-}
-
-static int openssl_dtls_gen_certificate(DTLSContext *ctx)
-{
-    int ret = 0, serial, expire_day, i, n = 0;
-    const char *aor = "lavf";
-    X509_NAME* subject = NULL;
-    X509 *dtls_cert = NULL;
-
-    dtls_cert = ctx->dtls_cert = X509_new();
-    if (!dtls_cert) {
-        goto enomem_end;
-    }
-
-    // TODO: Support non-self-signed certificate, for example, load from a file.
-    subject = X509_NAME_new();
-    if (!subject) {
-        goto enomem_end;
-    }
-
-    serial = (int)av_get_random_seed();
-    if (ASN1_INTEGER_set(X509_get_serialNumber(dtls_cert), serial) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set serial, %s\n", openssl_get_error(ctx));
-        goto einval_end;
-    }
-
-    if (X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, aor, strlen(aor), -1, 0) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set CN, %s\n", openssl_get_error(ctx));
-        goto einval_end;
-    }
-
-    if (X509_set_issuer_name(dtls_cert, subject) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set issuer, %s\n", openssl_get_error(ctx));
-        goto einval_end;
-    }
-    if (X509_set_subject_name(dtls_cert, subject) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set subject name, %s\n", openssl_get_error(ctx));
-        goto einval_end;
-    }
-
-    expire_day = 365;
-    if (!X509_gmtime_adj(X509_get_notBefore(dtls_cert), 0)) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set notBefore, %s\n", openssl_get_error(ctx));
-        goto einval_end;
-    }
-    if (!X509_gmtime_adj(X509_get_notAfter(dtls_cert), 60*60*24*expire_day)) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set notAfter, %s\n", openssl_get_error(ctx));
-        goto einval_end;
-    }
-
-    if (X509_set_version(dtls_cert, 2) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set version, %s\n", openssl_get_error(ctx));
-        goto einval_end;
-    }
-
-    if (X509_set_pubkey(dtls_cert, ctx->dtls_pkey) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set public key, %s\n", openssl_get_error(ctx));
-        goto einval_end;
-    }
-
-    if (!X509_sign(dtls_cert, ctx->dtls_pkey, EVP_sha1())) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to sign certificate, %s\n", openssl_get_error(ctx));
-        goto einval_end;
-    }
-
-    ctx->dtls_fingerprint = generate_dtls_fingerprint(ctx, dtls_cert);
-    if (!ctx->dtls_fingerprint) {
-        goto enomem_end;
-    }
-
-    goto end;
-enomem_end:
-    ret = AVERROR(ENOMEM);
-    goto end;
-eio_end:
-    ret = AVERROR(EIO);
-    goto end;
-einval_end:
-    ret = AVERROR(EINVAL);
-end:
-    X509_NAME_free(subject);
-    //av_bprint_finalize(&fingerprint, NULL);
-    return ret;
-}
-
-/**
  * Initializes DTLS context using ECDHE.
  */
 static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
@@ -497,7 +286,22 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
      * The profile for FFmpeg's SRTP is SRTP_AES128_CM_HMAC_SHA1_80, see libavformat/srtp.c.
      */
     const char* profiles = "SRTP_AES128_CM_SHA1_80";
-
+    /* setup private key and certificate */
+    if (ctx->key_buf)
+        dtls_pkey = pkey_from_pem_string(ctx->key_buf, 1);
+    else {
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Init pkey failed, %s\n", openssl_get_error(ctx));
+        ret = AVERROR(EINVAL);
+        goto end;
+    }
+    if (ctx->cert_buf)
+        dtls_cert = cert_from_pem_string(ctx->cert_buf);
+    else {
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Init cert failed, %s\n", openssl_get_error(ctx));
+        ret = AVERROR(EINVAL);
+        goto end;
+    }
+        
     /* Refer to the test cases regarding these curves in the WebRTC code. */
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L /* OpenSSL 1.1.0 */
     const char* curves = "X25519:P-256:P-384:P-521";
@@ -637,50 +441,6 @@ end:
 }
 
 /**
- * Generate a self-signed certificate and private key for DTLS. Please note that the
- * ff_openssl_init in tls_openssl.c has already called SSL_library_init(), and therefore,
- * there is no need to call it again.
- */
-static av_cold int dtls_context_init(AVFormatContext *s, DTLSContext *ctx)
-{
-    int ret = 0;
-
-    ctx->dtls_init_starttime = av_gettime();
-
-    if (ctx->cert_file && ctx->key_file) {
-        /* Read the private key and file from the file. */
-        if ((ret = openssl_read_certificate(s, ctx)) < 0) {
-            av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to read DTLS certificate from cert=%s, key=%s\n",
-                ctx->cert_file, ctx->key_file);
-            return ret;
-        }
-    } else {
-        /* Generate a private key to ctx->dtls_pkey. */
-        if ((ret = openssl_dtls_gen_private_key(ctx)) < 0) {
-            av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to generate DTLS private key\n");
-            return ret;
-        }
-
-        /* Generate a self-signed certificate. */
-        if ((ret = openssl_dtls_gen_certificate(ctx)) < 0) {
-            av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to generate DTLS certificate\n");
-            return ret;
-        }
-    }
-
-    if ((ret = openssl_dtls_init_context(ctx)) < 0) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to initialize DTLS context\n");
-        return ret;
-    }
-
-    ctx->dtls_init_endtime = av_gettime();
-    av_log(ctx, AV_LOG_VERBOSE, "DTLS: Setup ok, MTU=%d, cost=%dms, fingerprint %s\n",
-        ctx->mtu, ELAPSED(ctx->dtls_init_starttime, av_gettime()), ctx->dtls_fingerprint);
-
-    return ret;
-}
-
-/**
  * Once the DTLS role has been negotiated - active for the DTLS client or passive for the
  * DTLS server - we proceed to set up the DTLS state and initiate the handshake.
  */
@@ -690,7 +450,13 @@ static int dtls_context_start(URLContext *h, const char *url, int flags, AVDicti
     int ret = 0, r0, r1;
     SSL *dtls = NULL;
 
-    dtls_context_init(NULL, ctx);
+    ctx->dtls_init_starttime = av_gettime();
+    
+    if ((ret = openssl_dtls_init_context(ctx)) < 0) {
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to initialize DTLS context\n");
+        return ret;
+    }
+
     dtls = ctx->dtls;
 
     ctx->dtls_handshake_starttime = av_gettime();
@@ -715,6 +481,10 @@ static int dtls_context_start(URLContext *h, const char *url, int flags, AVDicti
         return AVERROR(EIO);
     }
 
+    ctx->dtls_init_endtime = av_gettime();
+    av_log(ctx, AV_LOG_VERBOSE, "DTLS: Setup ok, MTU=%d, cost=%dms, fingerprint %s\n",
+        ctx->mtu, ELAPSED(ctx->dtls_init_starttime, av_gettime()), ctx->dtls_fingerprint);
+        
     return ret;
 }
 
@@ -734,8 +504,6 @@ static int dtls_context_write(URLContext *h, const uint8_t* buf, int size)
     SSL *dtls = ctx->dtls;
     const char* dst = "EXTRACTOR-dtls_srtp";
     BIO *bio_in = ctx->bio_in;
-    static int num = 0;
-    printf("num: %d\n", ++num);
 
     /* Got DTLS response successfully. */
     openssl_dtls_state_trace(ctx, buf, size, 1);
@@ -806,8 +574,8 @@ static av_cold int dtls_context_deinit(URLContext *h)
     X509_free(ctx->dtls_cert);
     EVP_PKEY_free(ctx->dtls_pkey);
     av_freep(&ctx->dtls_fingerprint);
-    av_freep(&ctx->cert_file);
-    av_freep(&ctx->key_file);
+    av_freep(&ctx->cert_buf);
+    av_freep(&ctx->key_buf);
 #if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
     EC_KEY_free(ctx->dtls_eckey);
 #endif
@@ -817,8 +585,9 @@ static av_cold int dtls_context_deinit(URLContext *h)
 #define OFFSET(x) offsetof(DTLSContext, x)
 static const AVOption options[] = {
     { "mtu", "Maximum Transmission Unit", OFFSET(mtu), AV_OPT_TYPE_INT, { .i64 = -1}, -1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
-    { "cert_file", "The optional certificate file path for DTLS", OFFSET(cert_file), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
-    { "key_file", "The optional private key file path for DTLS", OFFSET(key_file), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
+    { "fingerprint", "The optional fingerprint for DTLS", OFFSET(dtls_fingerprint), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
+    { "cert_buf", "The optional certificate buffer for DTLS", OFFSET(cert_buf), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
+    { "key_buf", "The optional private key buffer for DTLS", OFFSET(key_buf), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
     { NULL }
 };
 
@@ -828,11 +597,6 @@ static const AVClass dtls_class = {
     .option     = options,
     .version    = LIBAVUTIL_VERSION_INT,
 };
-
-static int dtls_context_tem_write(URLContext *h, const u_char* buf, int size)
-{
-    return 0;
-}
 
 const URLProtocol ff_dtls_protocol = {
     .name           = "dtls",

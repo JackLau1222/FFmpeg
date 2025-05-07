@@ -124,6 +124,7 @@ typedef struct DTLSContext {
     DTLSContext_on_write_fn on_write;
 
     URLContext *udp_uc;
+    char *http_proxy;
 
     void* opaque;
 

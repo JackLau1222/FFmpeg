@@ -25,9 +25,93 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/random_seed.h"
 #include "libavutil/time.h"
+#include "libavutil/opt.h"
+#include "libavutil/getenv_utf8.h"
 #include "http.h"
 #include "mux.h"
 #include "srtp.h"
+#include "url.h"
+
+static int ff_dtls_open_underlying(DTLSContext *c, URLContext *parent, const char *uri, AVDictionary **options)
+{
+    int port;
+    char host[200];
+    const char *p;
+    char buf[200], opts[50] = "";
+    struct addrinfo hints = { 0 }, *ai = NULL;
+    const char *proxy_path;
+    char *env_http_proxy, *env_no_proxy;
+    int use_proxy;
+    int ret;
+
+    // ret = set_options(c, uri);
+    // if (ret < 0)
+    //     return ret;
+
+    // if (c->listen)
+    //     snprintf(opts, sizeof(opts), "?listen=1");
+
+    av_url_split(NULL, 0, NULL, 0, host, sizeof(host), &port, NULL, 0, uri);
+
+    av_dict_set_int(&opts, "connect", 1, 0);
+    av_dict_set_int(&opts, "fifo_size", 0, 0);
+    /* Set the max packet size to the buffer size. */
+    av_dict_set_int(&opts, "pkt_size", c->mtu, 0);
+
+    p = strchr(uri, '?');
+
+    if (!p) {
+        p = opts;
+    } else {
+        // if (av_find_info_tag(opts, sizeof(opts), "listen", p))
+        //     c->listen = 1;
+    }
+
+    ff_url_join(buf, sizeof(buf), "udp", NULL, host, ++port, "%s", p);
+
+    hints.ai_flags = AI_NUMERICHOST;
+    if (!getaddrinfo(host, NULL, &hints, &ai)) {
+        // c->numerichost = 1;
+        freeaddrinfo(ai);
+    }
+
+    // if (!host && !(host = av_strdup(host)))
+    //     return AVERROR(ENOMEM);
+
+    env_http_proxy = getenv_utf8("http_proxy");
+    proxy_path = c->http_proxy ? c->http_proxy : env_http_proxy;
+
+    env_no_proxy = getenv_utf8("no_proxy");
+    use_proxy = !ff_http_match_no_proxy(env_no_proxy, host) &&
+                proxy_path && av_strstart(proxy_path, "http://", NULL);
+    freeenv_utf8(env_no_proxy);
+
+    if (use_proxy) {
+        char proxy_host[200], proxy_auth[200], dest[200];
+        int proxy_port;
+        av_url_split(NULL, 0, proxy_auth, sizeof(proxy_auth),
+                     proxy_host, sizeof(proxy_host), &proxy_port, NULL, 0,
+                     proxy_path);
+        ff_url_join(dest, sizeof(dest), NULL, NULL, host, port, NULL);
+        ff_url_join(buf, sizeof(buf), "httpproxy", proxy_auth, proxy_host,
+                    proxy_port, "/%s", dest);
+    }
+
+    freeenv_utf8(env_http_proxy);
+    ret = ffurl_open_whitelist(&c->udp_uc, buf, AVIO_FLAG_READ_WRITE,
+                                &parent->interrupt_callback, options,
+                                parent->protocol_whitelist, parent->protocol_blacklist, parent);
+
+    if (ret < 0) {
+        av_log(c, AV_LOG_ERROR, "WHIP: Failed to connect udp://%s:%d\n", host, port);
+        return ret;
+    }
+
+    /* Make the socket non-blocking, set to READ and WRITE mode after connected */
+    ff_socket_nonblock(ffurl_get_file_handle(c->udp_uc), 1);
+    c->udp_uc->flags |= AVIO_FLAG_READ | AVIO_FLAG_NONBLOCK;
+    return 0;
+}
 
 /**
  * Deserialize a PEM‐encoded private or public key from a NUL-terminated C string.
@@ -456,6 +540,11 @@ static int dtls_context_start(URLContext *h, const char *url, int flags, AVDicti
         av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to initialize DTLS context\n");
         return ret;
     }
+
+    // if ((ret = ff_dtls_open_underlying(ctx, h, url, options)) < 0) {
+    //     av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to connect %s\n", url);
+    //     return ret;
+    // }
 
     dtls = ctx->dtls;
 

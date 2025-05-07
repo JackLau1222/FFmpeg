@@ -250,6 +250,30 @@ static BIO_METHOD url_bio_method = {
 };
 #endif
 
+static void tls_info_callback(const SSL *ssl, int where, int ret) {
+    const char *direction = "";
+    const char *method = "undefined";
+    if (where & SSL_CB_READ) {
+        direction = "Received";
+    } else if (where & SSL_CB_WRITE) {
+        direction = "Sent";
+    }
+
+    if (where & SSL_ST_CONNECT)
+        method = "SSL_connect";
+    else if (where & SSL_ST_ACCEPT)
+        method = "SSL_accept";
+    
+    if (where & SSL_CB_LOOP) {
+        printf("TLS: Info method=%s state=%s(%s), where=%d, ret=%d\n",
+            method, SSL_state_string(ssl), SSL_state_string_long(ssl), where, ret);
+    } else if (where & SSL_CB_ALERT) {
+        method = (where & SSL_CB_READ) ? "read":"write";
+        printf("TLS: Alert method=%s state=%s(%s), where=%d, ret=%d\n",
+            method, SSL_state_string(ssl), SSL_state_string_long(ssl), where, ret);
+    }
+}
+
 static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **options)
 {
     TLSContext *p = h->priv_data;
@@ -275,6 +299,7 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
         ret = AVERROR(EIO);
         goto fail;
     }
+    SSL_CTX_set_info_callback(p->ctx, tls_info_callback);
     SSL_CTX_set_options(p->ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
     if (c->ca_file) {
         if (!SSL_CTX_load_verify_locations(p->ctx, c->ca_file, NULL))

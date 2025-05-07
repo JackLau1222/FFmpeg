@@ -135,7 +135,10 @@ typedef struct DTLSContext {
     SSL_CTX *dtls_ctx;
     SSL *dtls;
     /* The DTLS BIOs. */
-    BIO *bio_in;
+    BIO *bio;
+#if OPENSSL_VERSION_NUMBER >= 0x1010000fL
+    BIO_METHOD* url_bio_method;
+#endif
 
     /* The private key for DTLS handshake. */
     EVP_PKEY *dtls_pkey;

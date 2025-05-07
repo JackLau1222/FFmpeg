@@ -122,6 +122,8 @@ enum WHIPState {
     WHIP_STATE_ICE_CONNECTING,
     /* The muxer has received the ICE response from the peer. */
     WHIP_STATE_ICE_CONNECTED,
+    /* The muxer starts attempting the DTLS handshake. */
+    WHIP_STATE_DTLS_CONNECTING,
     /* The muxer has finished the DTLS handshake with the peer. */
     WHIP_STATE_DTLS_FINISHED,
     /* The muxer has finished the SRTP setup. */
@@ -743,6 +745,8 @@ static av_cold int dtls_initialize(AVFormatContext *s)
     /* Use the same logging context as AV format. */
     DTLSContext *dtls_ctx = whip->dtls_uc->priv_data;
     dtls_ctx->opaque = s;
+    /* reuse the udp created by whip */
+    dtls_ctx->udp_uc = whip->udp_uc;
     dtls_ctx->on_state = dtls_context_on_state;
     dtls_ctx->on_write = dtls_context_on_write;
     return 0;
@@ -1611,7 +1615,7 @@ next_packet:
         }
 
         /* Read the STUN or DTLS messages from peer. */
-        for (i = 0; i < ICE_DTLS_READ_INTERVAL / 5; i++) {
+        for (i = 0; i < ICE_DTLS_READ_INTERVAL / 5 && whip->state < WHIP_STATE_DTLS_CONNECTING; i++) {
             ret = ffurl_read(whip->udp_uc, whip->buf, sizeof(whip->buf));
             if (ret > 0)
                 break;
@@ -1663,6 +1667,7 @@ next_packet:
 
         /* If got any DTLS messages, handle it. */
         if (is_dtls_packet(whip->buf, ret) && whip->state >= WHIP_STATE_ICE_CONNECTED) {
+            whip->state = WHIP_STATE_DTLS_CONNECTING;
             if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0)
                 goto end;
             goto next_packet;

@@ -32,6 +32,8 @@
 #include "srtp.h"
 #include "url.h"
 
+static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length, int incoming);
+
 static int ff_dtls_open_underlying(DTLSContext *c, URLContext *parent, const char *uri, AVDictionary **options)
 {
     int port;
@@ -180,6 +182,93 @@ int is_dtls_packet(uint8_t *b, int size) {
         b[0] >= DTLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC &&
         (version == DTLS_VERSION_10 || version == DTLS_VERSION_12);
 }
+
+static int url_bio_create(BIO *b)
+{
+#if OPENSSL_VERSION_NUMBER >= 0x1010000fL
+    BIO_set_init(b, 1);
+    BIO_set_data(b, NULL);
+    BIO_set_flags(b, 0);
+#else
+    b->init = 1;
+    b->ptr = NULL;
+    b->flags = 0;
+#endif
+    return 1;
+}
+
+static int url_bio_destroy(BIO *b)
+{
+    return 1;
+}
+
+#if OPENSSL_VERSION_NUMBER >= 0x1010000fL
+#define GET_BIO_DATA(x) BIO_get_data(x)
+#else
+#define GET_BIO_DATA(x) (x)->ptr
+#endif
+
+static int url_bio_bread(BIO *b, char *buf, int len)
+{
+    DTLSContext *c = GET_BIO_DATA(b);
+    int ret = ffurl_read(c->udp_uc, buf, len);
+    if (ret >= 0)
+        return ret;
+    BIO_clear_retry_flags(b);
+    if (ret == AVERROR_EXIT)
+        return 0;
+    if (ret == AVERROR(EAGAIN))
+        BIO_set_retry_read(b);
+    else
+        c->error_code = ret;
+    openssl_dtls_state_trace(c, buf, len, 1);
+    return -1;
+}
+
+static int url_bio_bwrite(BIO *b, const char *buf, int len)
+{
+    DTLSContext *c = GET_BIO_DATA(b);
+    int ret = ffurl_write(c->udp_uc, buf, len);
+    if (ret >= 0)
+        return ret;
+    BIO_clear_retry_flags(b);
+    if (ret == AVERROR_EXIT)
+        return 0;
+    if (ret == AVERROR(EAGAIN))
+        BIO_set_retry_write(b);
+    else
+        c->error_code = ret;
+    openssl_dtls_state_trace(c, buf, len, 0);
+    return -1;
+}
+
+static long url_bio_ctrl(BIO *b, int cmd, long num, void *ptr)
+{
+    if (cmd == BIO_CTRL_FLUSH) {
+        BIO_clear_retry_flags(b);
+        return 1;
+    }
+    return 0;
+}
+
+static int url_bio_bputs(BIO *b, const char *str)
+{
+    return url_bio_bwrite(b, str, strlen(str));
+}
+
+#if OPENSSL_VERSION_NUMBER < 0x1010000fL
+static BIO_METHOD url_bio_method = {
+    .type = BIO_TYPE_SOURCE_SINK,
+    .name = "urlprotocol bio",
+    .bwrite = url_bio_bwrite,
+    .bread = url_bio_bread,
+    .bputs = url_bio_bputs,
+    .bgets = NULL,
+    .ctrl = url_bio_ctrl,
+    .create = url_bio_create,
+    .destroy = url_bio_destroy,
+};
+#endif
 
 /**
  * Retrieves the error message for the latest OpenSSL error.
@@ -363,13 +452,27 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     X509 *dtls_cert = ctx->dtls_cert;
     SSL_CTX *dtls_ctx = NULL;
     SSL *dtls = NULL;
-    BIO *bio_in = NULL, *bio_out = NULL;
+    BIO *bio = NULL;
     const char* ciphers = "ALL";
     /**
      * The profile for OpenSSL's SRTP is SRTP_AES128_CM_SHA1_80, see ssl/d1_srtp.c.
      * The profile for FFmpeg's SRTP is SRTP_AES128_CM_HMAC_SHA1_80, see libavformat/srtp.c.
      */
     const char* profiles = "SRTP_AES128_CM_SHA1_80";
+#if OPENSSL_VERSION_NUMBER >= 0x1010000fL
+    ctx->url_bio_method = BIO_meth_new(BIO_TYPE_SOURCE_SINK, "urlprotocol bio");
+    BIO_meth_set_write(ctx->url_bio_method, url_bio_bwrite);
+    BIO_meth_set_read(ctx->url_bio_method, url_bio_bread);
+    BIO_meth_set_puts(ctx->url_bio_method, url_bio_bputs);
+    BIO_meth_set_ctrl(ctx->url_bio_method, url_bio_ctrl);
+    BIO_meth_set_create(ctx->url_bio_method, url_bio_create);
+    BIO_meth_set_destroy(ctx->url_bio_method, url_bio_destroy);
+    bio = BIO_new(ctx->url_bio_method);
+    BIO_set_data(bio, ctx);
+#else
+    bio = BIO_new(&url_bio_method);
+    bio->ptr = p;
+#endif
     /* setup private key and certificate */
     if (ctx->key_buf)
         dtls_pkey = pkey_from_pem_string(ctx->key_buf, 1);
@@ -480,17 +583,17 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     DTLS_set_link_mtu(dtls, ctx->mtu);
 #endif
 
-    bio_in = BIO_new(BIO_s_mem());
-    if (!bio_in) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
+    // bio = BIO_new(ctx->url_bio_method);
+    // if (!bio) {
+    //     ret = AVERROR(ENOMEM);
+    //     goto end;
+    // }
 
-    bio_out = BIO_new(BIO_s_mem());
-    if (!bio_out) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
+    // bio_out = BIO_new(BIO_s_mem());
+    // if (!bio_out) {
+    //     ret = AVERROR(ENOMEM);
+    //     goto end;
+    // }
 
     /**
      * Please be aware that it is necessary to use a callback to obtain the packet to be written out. It is
@@ -506,21 +609,21 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
      * Note that there should be more packets in real world, like ServerKeyExchange, CertificateRequest,
      * and ServerHelloDone. Here we just use two packets for example.
      */
-#if OPENSSL_VERSION_NUMBER < 0x30000000L // v3.0.x
-    BIO_set_callback(bio_out, openssl_dtls_bio_out_callback);
-#else
-    BIO_set_callback_ex(bio_out, openssl_dtls_bio_out_callback_ex);
-#endif
-    BIO_set_callback_arg(bio_out, (char*)ctx);
+// #if OPENSSL_VERSION_NUMBER < 0x30000000L // v3.0.x
+//     BIO_set_callback(bio, openssl_dtls_bio_out_callback);
+// #else
+//     BIO_set_callback_ex(bio, openssl_dtls_bio_out_callback_ex);
+// #endif
+//     BIO_set_callback_arg(bio, (char*)ctx);
 
-    ctx->bio_in = bio_in;
-    SSL_set_bio(dtls, bio_in, bio_out);
-    /* Now the bio_in and bio_out are owned by dtls, so we should set them to NULL. */
-    bio_in = bio_out = NULL;
+    ctx->bio = bio;
+    SSL_set_bio(dtls, bio, bio);
+    /* Now the bio and bio_out are owned by dtls, so we should set them to NULL. */
+    bio = NULL;
 
 end:
-    BIO_free(bio_in);
-    BIO_free(bio_out);
+    BIO_free(bio);
+    // BIO_free(bio_out);
     return ret;
 }
 
@@ -562,7 +665,7 @@ static int dtls_context_start(URLContext *h, const char *url, int flags, AVDicti
      * response, this shouldn't be an issue as the handshake function is called before any DTLS
      * packets are received.
      */
-    r0 = SSL_do_handshake(dtls);
+    // r0 = SSL_do_handshake(dtls);
     r1 = openssl_ssl_get_error(ctx, r0);
     // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
     if (r0 < 0 && (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)) {
@@ -573,7 +676,7 @@ static int dtls_context_start(URLContext *h, const char *url, int flags, AVDicti
     ctx->dtls_init_endtime = av_gettime();
     av_log(ctx, AV_LOG_VERBOSE, "DTLS: Setup ok, MTU=%d, cost=%dms, fingerprint %s\n",
         ctx->mtu, ELAPSED(ctx->dtls_init_starttime, av_gettime()), ctx->dtls_fingerprint);
-        
+
     return ret;
 }
 
@@ -592,24 +695,25 @@ static int dtls_context_write(URLContext *h, const uint8_t* buf, int size)
     int ret = 0, res_ct, res_ht, r0, r1, do_callback;
     SSL *dtls = ctx->dtls;
     const char* dst = "EXTRACTOR-dtls_srtp";
-    BIO *bio_in = ctx->bio_in;
+    BIO *bio = ctx->bio;
 
     /* Got DTLS response successfully. */
-    openssl_dtls_state_trace(ctx, buf, size, 1);
-    if ((r0 = BIO_write(bio_in, buf, size)) <= 0) {
-        res_ct = size > 0 ? buf[0]: 0;
-        res_ht = size > 13 ? buf[13] : 0;
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Feed response failed, content=%d, handshake=%d, size=%d, r0=%d\n",
-            res_ct, res_ht, size, r0);
-        ret = AVERROR(EIO);
-        goto error;
-    }
+    // openssl_dtls_state_trace(ctx, buf, size, 1);
+    // if ((r0 = BIO_write(bio, buf, size)) <= 0) {
+    //     res_ct = size > 0 ? buf[0]: 0;
+    //     res_ht = size > 13 ? buf[13] : 0;
+    //     av_log(ctx, AV_LOG_ERROR, "DTLS: Feed response failed, content=%d, handshake=%d, size=%d, r0=%d\n",
+    //         res_ct, res_ht, size, r0);
+    //     ret = AVERROR(EIO);
+    //     goto error;
+    // }
 
     /**
      * If there is data available in bio_in, use SSL_read to allow SSL to process it.
      * We limit the MTU to 1200 for DTLS handshake, which ensures that the buffer is large enough for reading.
      */
-    r0 = SSL_read(dtls, buf, sizeof(buf));
+    // r0 = SSL_read(dtls, buf, sizeof(buf));
+    r0 = SSL_write(dtls, buf, size);
     r1 = openssl_ssl_get_error(ctx, r0);
     if (r0 <= 0) {
         if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
@@ -674,7 +778,7 @@ static av_cold int dtls_context_deinit(URLContext *h)
 #define OFFSET(x) offsetof(DTLSContext, x)
 static const AVOption options[] = {
     { "mtu", "Maximum Transmission Unit", OFFSET(mtu), AV_OPT_TYPE_INT, { .i64 = -1}, -1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
-    { "fingerprint", "The optional fingerprint for DTLS", OFFSET(dtls_fingerprint), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
+    { "dtls_fingerprint", "The optional fingerprint for DTLS", OFFSET(dtls_fingerprint), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
     { "cert_buf", "The optional certificate buffer for DTLS", OFFSET(cert_buf), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
     { "key_buf", "The optional private key buffer for DTLS", OFFSET(key_buf), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
     { NULL }

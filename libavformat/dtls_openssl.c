@@ -39,7 +39,8 @@ static int ff_dtls_open_underlying(DTLSContext *c, URLContext *parent, const cha
     int port;
     char host[200];
     const char *p;
-    char buf[200], opts[50] = "";
+    char buf[200];
+    AVDictionary *opts = NULL;
     struct addrinfo hints = { 0 }, *ai = NULL;
     const char *proxy_path;
     char *env_http_proxy, *env_no_proxy;
@@ -62,12 +63,6 @@ static int ff_dtls_open_underlying(DTLSContext *c, URLContext *parent, const cha
 
     p = strchr(uri, '?');
 
-    if (!p) {
-        p = opts;
-    } else {
-        // if (av_find_info_tag(opts, sizeof(opts), "listen", p))
-        //     c->listen = 1;
-    }
 
     ff_url_join(buf, sizeof(buf), "udp", NULL, host, ++port, "%s", p);
 
@@ -171,18 +166,6 @@ static X509 *cert_from_pem_string(const char *pem_str)
     return cert;
 }
 
-
-
-/**
- * Whether the packet is a DTLS packet.
- */
-int is_dtls_packet(uint8_t *b, int size) {
-    uint16_t version = AV_RB16(&b[1]);
-    return size > DTLS_RECORD_LAYER_HEADER_LEN &&
-        b[0] >= DTLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC &&
-        (version == DTLS_VERSION_10 || version == DTLS_VERSION_12);
-}
-
 static int url_bio_create(BIO *b)
 {
 #if OPENSSL_VERSION_NUMBER >= 0x1010000fL
@@ -221,7 +204,7 @@ static int url_bio_bread(BIO *b, char *buf, int len)
         BIO_set_retry_read(b);
     else
         c->error_code = ret;
-    openssl_dtls_state_trace(c, buf, len, 1);
+    // openssl_dtls_state_trace(c, buf, len, 1);
     return -1;
 }
 
@@ -238,7 +221,7 @@ static int url_bio_bwrite(BIO *b, const char *buf, int len)
         BIO_set_retry_write(b);
     else
         c->error_code = ret;
-    openssl_dtls_state_trace(c, buf, len, 0);
+    // openssl_dtls_state_trace(c, buf, len, 0);
     return -1;
 }
 
@@ -315,7 +298,6 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
 {
     int w, r1, is_fatal, is_warning, is_close_notify;
     const char *method = "undefined", *alert_type, *alert_desc;
-    enum DTLSState state;
     DTLSContext *ctx = (DTLSContext*)SSL_get_ex_data(dtls, 0);
 
     w = where & ~SSL_ST_MASK;
@@ -349,11 +331,10 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
         is_fatal = !av_strncasecmp(alert_type, "fatal", 5);
         is_warning = !av_strncasecmp(alert_type, "warning", 7);
         is_close_notify = !av_strncasecmp(alert_desc, "CN", 2);
-        state = is_fatal ? DTLS_STATE_FAILED : (is_warning && is_close_notify ? DTLS_STATE_CLOSED : DTLS_STATE_NONE);
-        if (state != DTLS_STATE_NONE && ctx->on_state) {
+        ctx->state = is_fatal ? DTLS_STATE_FAILED : (is_warning && is_close_notify ? DTLS_STATE_CLOSED : DTLS_STATE_NONE);
+        if (ctx->state != DTLS_STATE_NONE) {
             av_log(ctx, AV_LOG_INFO, "DTLS: Notify ctx=%p, state=%d, fatal=%d, warning=%d, cn=%d\n",
-                ctx, state, is_fatal, is_warning, is_close_notify);
-            ctx->on_state(ctx, state, alert_type, alert_desc);
+                ctx, ctx->state, is_fatal, is_warning, is_close_notify);
         }
     } else if (where & SSL_CB_EXIT) {
         if (!r0)
@@ -395,51 +376,6 @@ static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length
 static int openssl_dtls_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
 {
     return 1;
-}
-
-/**
- * DTLS BIO read callback.
- */
-#if OPENSSL_VERSION_NUMBER < 0x30000000L // v3.0.x
-static long openssl_dtls_bio_out_callback(BIO* b, int oper, const char* argp, int argi, long argl, long retvalue)
-#else
-static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp, size_t len, int argi, long argl, int retvalue, size_t *processed)
-#endif
-{
-    int ret, req_size = argi, is_arq = 0;
-    uint8_t content_type, handshake_type;
-    uint8_t *data = (uint8_t*)argp;
-    DTLSContext* ctx = b ? (DTLSContext*)BIO_get_callback_arg(b) : NULL;
-
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L // v3.0.x
-    req_size = len;
-    av_log(ctx, AV_LOG_DEBUG, "DTLS: BIO callback b=%p, oper=%d, argp=%p, len=%ld, argi=%d, argl=%ld, retvalue=%d, processed=%p, req_size=%d\n",
-        b, oper, argp, len, argi, argl, retvalue, processed, req_size);
-#else
-    av_log(ctx, AV_LOG_DEBUG, "DTLS: BIO callback b=%p, oper=%d, argp=%p, argi=%d, argl=%ld, retvalue=%ld, req_size=%d\n",
-        b, oper, argp, argi, argl, retvalue, req_size);
-#endif
-
-    if (oper != BIO_CB_WRITE || !argp || req_size <= 0)
-        return retvalue;
-
-    openssl_dtls_state_trace(ctx, data, req_size, 0);
-    ret = ctx->on_write ? ctx->on_write(ctx, data, req_size) : 0;
-    content_type = req_size > 0 ? AV_RB8(&data[0]) : 0;
-    handshake_type = req_size > 13 ? AV_RB8(&data[13]) : 0;
-
-    is_arq = ctx->dtls_last_content_type == content_type && ctx->dtls_last_handshake_type == handshake_type;
-    ctx->dtls_arq_packets += is_arq;
-    ctx->dtls_last_content_type = content_type;
-    ctx->dtls_last_handshake_type = handshake_type;
-
-    if (ret < 0) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Send request failed, oper=%d, content=%d, handshake=%d, size=%d, is_arq=%d\n",
-            oper, content_type, handshake_type, req_size, is_arq);
-        return ret;
-    }
-
-    return retvalue;
 }
 
 /**
@@ -583,47 +519,13 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     DTLS_set_link_mtu(dtls, ctx->mtu);
 #endif
 
-    // bio = BIO_new(ctx->url_bio_method);
-    // if (!bio) {
-    //     ret = AVERROR(ENOMEM);
-    //     goto end;
-    // }
-
-    // bio_out = BIO_new(BIO_s_mem());
-    // if (!bio_out) {
-    //     ret = AVERROR(ENOMEM);
-    //     goto end;
-    // }
-
-    /**
-     * Please be aware that it is necessary to use a callback to obtain the packet to be written out. It is
-     * imperative that BIO_get_mem_data is not used to retrieve the packet, as it returns all the bytes that
-     * need to be sent out.
-     * For example, if MTU is set to 1200, and we got two DTLS packets to sendout:
-     *      ServerHello, 95bytes.
-     *      Certificate, 1105+143=1248bytes.
-     * If use BIO_get_mem_data, it will return 95+1248=1343bytes, which is larger than MTU 1200.
-     * If use callback, it will return two UDP packets:
-     *      ServerHello+Certificate(Frament) = 95+1105=1200bytes.
-     *      Certificate(Fragment) = 143bytes.
-     * Note that there should be more packets in real world, like ServerKeyExchange, CertificateRequest,
-     * and ServerHelloDone. Here we just use two packets for example.
-     */
-// #if OPENSSL_VERSION_NUMBER < 0x30000000L // v3.0.x
-//     BIO_set_callback(bio, openssl_dtls_bio_out_callback);
-// #else
-//     BIO_set_callback_ex(bio, openssl_dtls_bio_out_callback_ex);
-// #endif
-//     BIO_set_callback_arg(bio, (char*)ctx);
-
     ctx->bio = bio;
     SSL_set_bio(dtls, bio, bio);
-    /* Now the bio and bio_out are owned by dtls, so we should set them to NULL. */
+    /* Now the bio are owned by dtls, so we should set them to NULL. */
     bio = NULL;
 
 end:
     BIO_free(bio);
-    // BIO_free(bio_out);
     return ret;
 }
 
@@ -631,7 +533,7 @@ end:
  * Once the DTLS role has been negotiated - active for the DTLS client or passive for the
  * DTLS server - we proceed to set up the DTLS state and initiate the handshake.
  */
-static int dtls_context_start(URLContext *h, const char *url, int flags, AVDictionary **options)
+static int dtls_start(URLContext *h, const char *url, int flags, AVDictionary **options)
 {
     DTLSContext *ctx = h->priv_data;
     int ret = 0, r0, r1;
@@ -664,14 +566,16 @@ static int dtls_context_start(URLContext *h, const char *url, int flags, AVDicti
      * although the DTLS server may receive the ClientHello immediately after sending out the ICE
      * response, this shouldn't be an issue as the handshake function is called before any DTLS
      * packets are received.
+     * 
+     * The SSL_do_handshake can't be called if DTLS hasn't prepare for udp.
      */
     // r0 = SSL_do_handshake(dtls);
-    r1 = openssl_ssl_get_error(ctx, r0);
+    // r1 = openssl_ssl_get_error(ctx, r0);
     // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
-    if (r0 < 0 && (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
-        return AVERROR(EIO);
-    }
+    // if (r0 < 0 && (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)) {
+    //     av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
+    //     return AVERROR(EIO);
+    // }
 
     ctx->dtls_init_endtime = av_gettime();
     av_log(ctx, AV_LOG_VERBOSE, "DTLS: Setup ok, MTU=%d, cost=%dms, fingerprint %s\n",
@@ -689,30 +593,12 @@ static int dtls_context_start(URLContext *h, const char *url, int flags, AVDicti
  *
  * @return 0 if OK, AVERROR_xxx on error
  */
-static int dtls_context_write(URLContext *h, const uint8_t* buf, int size)
+static int dtls_write(URLContext *h, const uint8_t* buf, int size)
 {
     DTLSContext *ctx = h->priv_data;
-    int ret = 0, res_ct, res_ht, r0, r1, do_callback;
+    int ret = 0, r0, r1;
     SSL *dtls = ctx->dtls;
-    const char* dst = "EXTRACTOR-dtls_srtp";
-    BIO *bio = ctx->bio;
 
-    /* Got DTLS response successfully. */
-    // openssl_dtls_state_trace(ctx, buf, size, 1);
-    // if ((r0 = BIO_write(bio, buf, size)) <= 0) {
-    //     res_ct = size > 0 ? buf[0]: 0;
-    //     res_ht = size > 13 ? buf[13] : 0;
-    //     av_log(ctx, AV_LOG_ERROR, "DTLS: Feed response failed, content=%d, handshake=%d, size=%d, r0=%d\n",
-    //         res_ct, res_ht, size, r0);
-    //     ret = AVERROR(EIO);
-    //     goto error;
-    // }
-
-    /**
-     * If there is data available in bio_in, use SSL_read to allow SSL to process it.
-     * We limit the MTU to 1200 for DTLS handshake, which ensures that the buffer is large enough for reading.
-     */
-    // r0 = SSL_read(dtls, buf, sizeof(buf));
     r0 = SSL_write(dtls, buf, size);
     r1 = openssl_ssl_get_error(ctx, r0);
     if (r0 <= 0) {
@@ -729,37 +615,20 @@ static int dtls_context_write(URLContext *h, const uint8_t* buf, int size)
     if (SSL_is_init_finished(dtls) != 1)
         goto end;
 
-    do_callback = ctx->on_state && !ctx->dtls_done_for_us;
     ctx->dtls_done_for_us = 1;
+    ctx->state = DTLS_STATE_FINISHED;
     ctx->dtls_handshake_endtime = av_gettime();
 
-    /* Export SRTP master key after DTLS done */
-    if (!ctx->dtls_srtp_key_exported) {
-        ret = SSL_export_keying_material(dtls, ctx->dtls_srtp_materials, sizeof(ctx->dtls_srtp_materials),
-            dst, strlen(dst), NULL, 0, 0);
-        r1 = openssl_ssl_get_error(ctx, r0);
-        if (!ret) {
-            av_log(ctx, AV_LOG_ERROR, "DTLS: SSL export key ret=%d, r1=%d %s\n", ret, r1, ctx->error_message);
-            ret = AVERROR(EIO);
-            goto error;
-        }
-
-        ctx->dtls_srtp_key_exported = 1;
-    }
-
-    if (do_callback && (ret = ctx->on_state(ctx, DTLS_STATE_FINISHED, NULL, NULL)) < 0)
-        goto end;
-
-error:
-    //return ret;
 end:
     return size;
+error:
+    return ret;
 }
 
 /**
  * Cleanup the DTLS context.
  */
-static av_cold int dtls_context_deinit(URLContext *h)
+static av_cold int dtls_close(URLContext *h)
 {
     DTLSContext *ctx = h->priv_data;
     SSL_free(ctx->dtls);
@@ -793,10 +662,10 @@ static const AVClass dtls_class = {
 
 const URLProtocol ff_dtls_protocol = {
     .name           = "dtls",
-    .url_open2      = dtls_context_start,
+    .url_open2      = dtls_start,
     // .url_read       = tls_read,
-    .url_write      = dtls_context_write,
-    .url_close      = dtls_context_deinit,
+    .url_write      = dtls_write,
+    .url_close      = dtls_close,
     // .url_get_file_handle = tls_get_file_handle,
     // .url_get_short_seek  = tls_get_short_seek,
     .priv_data_size = sizeof(DTLSContext),

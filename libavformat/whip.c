@@ -1726,8 +1726,9 @@ next_packet:
                 av_dict_set(&opts, "cert_buf", cert_buf, 0);
                 av_dict_set(&opts, "key_buf", key_buf, 0);
                 av_dict_set(&opts, "dtls_fingerprint", whip->dtls_fingerprint, 0);
+                av_dict_set(&opts, "use_external_udp", "1", 0);
                 /* If got the first binding response, start DTLS handshake. */
-                ret = ffurl_open_whitelist(&whip->dtls_uc, buf, AVIO_FLAG_WRITE, &s->interrupt_callback,
+                ret = ffurl_open_whitelist(&whip->dtls_uc, buf, AVIO_FLAG_READ_WRITE, &s->interrupt_callback,
                     &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
                 if (ret < 0)
                     goto end;
@@ -1746,7 +1747,7 @@ next_packet:
         /* If got any DTLS messages, handle it. */
         if (is_dtls_packet(whip->buf, ret) && whip->state >= WHIP_STATE_ICE_CONNECTED) {
             whip->state = WHIP_STATE_DTLS_CONNECTING;
-            if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0)
+            if ((ret = ffurl_read(whip->dtls_uc, whip->buf, ret)) < 0)
                 goto end;
             dtls_context_on_state(s, NULL, NULL);
             goto next_packet;

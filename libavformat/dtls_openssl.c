@@ -40,7 +40,6 @@ static int ff_dtls_open_underlying(DTLSContext *c, URLContext *parent, const cha
     char host[200];
     const char *p;
     char buf[200];
-    AVDictionary *opts = NULL;
     struct addrinfo hints = { 0 }, *ai = NULL;
     const char *proxy_path;
     char *env_http_proxy, *env_no_proxy;
@@ -56,15 +55,15 @@ static int ff_dtls_open_underlying(DTLSContext *c, URLContext *parent, const cha
 
     av_url_split(NULL, 0, NULL, 0, host, sizeof(host), &port, NULL, 0, uri);
 
-    av_dict_set_int(&opts, "connect", 1, 0);
-    av_dict_set_int(&opts, "fifo_size", 0, 0);
+    av_dict_set_int(options, "connect", 1, 0);
+    av_dict_set_int(options, "fifo_size", 0, 0);
     /* Set the max packet size to the buffer size. */
-    av_dict_set_int(&opts, "pkt_size", c->mtu, 0);
+    av_dict_set_int(options, "pkt_size", c->mtu, 0);
 
     p = strchr(uri, '?');
 
 
-    ff_url_join(buf, sizeof(buf), "udp", NULL, host, ++port, "%s", p);
+    ff_url_join(buf, sizeof(buf), "udp", NULL, host, port, "%s", p);
 
     hints.ai_flags = AI_NUMERICHOST;
     if (!getaddrinfo(host, NULL, &hints, &ai)) {
@@ -546,10 +545,12 @@ static int dtls_start(URLContext *h, const char *url, int flags, AVDictionary **
         return ret;
     }
 
-    // if ((ret = ff_dtls_open_underlying(ctx, h, url, options)) < 0) {
-    //     av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to connect %s\n", url);
-    //     return ret;
-    // }
+    if (ctx->use_external_udp != 1) {
+        if ((ret = ff_dtls_open_underlying(ctx, h, url, options)) < 0) {
+            av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to connect %s\n", url);
+            return ret;
+        }
+    }
 
     dtls = ctx->dtls;
 
@@ -569,18 +570,52 @@ static int dtls_start(URLContext *h, const char *url, int flags, AVDictionary **
      * 
      * The SSL_do_handshake can't be called if DTLS hasn't prepare for udp.
      */
-    // r0 = SSL_do_handshake(dtls);
-    // r1 = openssl_ssl_get_error(ctx, r0);
-    // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
-    // if (r0 < 0 && (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)) {
-    //     av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
-    //     return AVERROR(EIO);
-    // }
+    if (ctx->use_external_udp != 1) {
+        r0 = SSL_do_handshake(dtls);
+        r1 = openssl_ssl_get_error(ctx, r0);
+        // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
+        if (r0 < 0 && (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)) {
+            av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
+            return AVERROR(EIO);
+        }
+    }
 
     ctx->dtls_init_endtime = av_gettime();
     av_log(ctx, AV_LOG_VERBOSE, "DTLS: Setup ok, MTU=%d, cost=%dms, fingerprint %s\n",
         ctx->mtu, ELAPSED(ctx->dtls_init_starttime, av_gettime()), ctx->dtls_fingerprint);
 
+    return ret;
+}
+
+static int dtls_read(URLContext *h, uint8_t *buf, int size)
+{
+    DTLSContext *ctx = h->priv_data;
+    int ret = 0, r0, r1;
+    SSL *dtls = ctx->dtls;
+
+    r0 = SSL_read(dtls, buf, size);
+    r1 = openssl_ssl_get_error(ctx, r0);
+    if (r0 <= 0) {
+        if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
+            av_log(ctx, AV_LOG_ERROR, "DTLS: Read failed, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
+            ret = AVERROR(EIO);
+            goto error;
+        }
+    } else {
+        av_log(ctx, AV_LOG_TRACE, "DTLS: Read %d bytes, r0=%d, r1=%d\n", r0, r0, r1);
+    }
+
+    /* Check whether the DTLS is completed. */
+    if (SSL_is_init_finished(dtls) != 1)
+        goto end;
+
+    ctx->dtls_done_for_us = 1;
+    ctx->state = DTLS_STATE_FINISHED;
+    ctx->dtls_handshake_endtime = av_gettime();
+
+end:
+    return size;
+error:
     return ret;
 }
 
@@ -603,12 +638,12 @@ static int dtls_write(URLContext *h, const uint8_t* buf, int size)
     r1 = openssl_ssl_get_error(ctx, r0);
     if (r0 <= 0) {
         if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
-            av_log(ctx, AV_LOG_ERROR, "DTLS: Read failed, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
+            av_log(ctx, AV_LOG_ERROR, "DTLS: Write failed, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
             ret = AVERROR(EIO);
             goto error;
         }
     } else {
-        av_log(ctx, AV_LOG_TRACE, "DTLS: Read %d bytes, r0=%d, r1=%d\n", r0, r0, r1);
+        av_log(ctx, AV_LOG_TRACE, "DTLS: Write %d bytes, r0=%d, r1=%d\n", r0, r0, r1);
     }
 
     /* Check whether the DTLS is completed. */
@@ -646,6 +681,7 @@ static av_cold int dtls_close(URLContext *h)
 
 #define OFFSET(x) offsetof(DTLSContext, x)
 static const AVOption options[] = {
+    { "use_external_udp", "Use external UDP from muxer or demuxer", OFFSET(use_external_udp), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
     { "mtu", "Maximum Transmission Unit", OFFSET(mtu), AV_OPT_TYPE_INT, { .i64 = -1}, -1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
     { "dtls_fingerprint", "The optional fingerprint for DTLS", OFFSET(dtls_fingerprint), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
     { "cert_buf", "The optional certificate buffer for DTLS", OFFSET(cert_buf), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
@@ -663,7 +699,7 @@ static const AVClass dtls_class = {
 const URLProtocol ff_dtls_protocol = {
     .name           = "dtls",
     .url_open2      = dtls_start,
-    // .url_read       = tls_read,
+    .url_read       = dtls_read,
     .url_write      = dtls_write,
     .url_close      = dtls_close,
     // .url_get_file_handle = tls_get_file_handle,

@@ -53,6 +53,7 @@ typedef struct DTLSContext {
 
     enum DTLSState state;
 
+    int use_external_udp;
     URLContext *udp_uc;
     char *http_proxy;
     /* temporarily don't need this to save AVFormatContext point */

@@ -19,9 +19,6 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-
 #include "libavcodec/avcodec.h"
 #include "libavcodec/codec_desc.h"
 #include "libavcodec/h264.h"
@@ -51,11 +48,6 @@
  * be it an offer or answer.
  */
 #define MAX_SDP_SIZE 8192
-
-/**
- * Maximum size limit of a certificate and private key size.
- */
-#define MAX_CERTIFICATE_SIZE 8192
 
 /**
  * The size of the Secure Real-time Transport Protocol (SRTP) master key material
@@ -264,12 +256,9 @@ typedef struct WHIPContext {
     int64_t whip_dtls_time;
     int64_t whip_srtp_time;
 
-    /* The private key for DTLS handshake. */
-    EVP_PKEY *dtls_pkey;
-    /* The EC key for DTLS handshake. */
-    EC_KEY* dtls_eckey;
-    /* The SSL certificate used for fingerprint in SDP and DTLS handshake. */
-    X509 *dtls_cert;
+    /* The certificate and private key content used for DTLS hanshake */
+    char cert_buf[MAX_CERTIFICATE_SIZE];
+    char key_buf[MAX_CERTIFICATE_SIZE];
     /* The fingerprint of certificate, used in SDP offer. */
     char *dtls_fingerprint;
     /**
@@ -315,68 +304,6 @@ typedef struct WHIPContext {
 } WHIPContext;
 
 /**
- * Retrieves the error message for the latest OpenSSL error.
- *
- * This function retrieves the error code from the thread's error queue, converts it
- * to a human-readable string, and stores it in the DTLSContext's error_message field.
- * The error queue is then cleared using ERR_clear_error().
- */
-static const char* openssl_get_error(WHIPContext *ctx)
-{
-    int r2 = ERR_get_error();
-    if (r2)
-        ERR_error_string_n(r2, ctx->ssl_error_message, sizeof(ctx->ssl_error_message));
-    else
-        ctx->ssl_error_message[0] = '\0';
-
-    ERR_clear_error();
-    return ctx->ssl_error_message;
-}
-
-/**
- * Read all data from the given URL url and store it in the given buffer bp.
- */
-static int url_read_all(AVFormatContext *s, const char *url, AVBPrint *bp)
-{
-    int ret = 0;
-    AVDictionary *opts = NULL;
-    URLContext *uc = NULL;
-    char buf[MAX_URL_SIZE];
-
-    ret = ffurl_open_whitelist(&uc, url, AVIO_FLAG_READ, &s->interrupt_callback,
-        &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
-    if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "WHIP: Failed to open url %s\n", url);
-        goto end;
-    }
-
-    while (1) {
-        ret = ffurl_read(uc, buf, sizeof(buf));
-        if (ret == AVERROR_EOF) {
-            /* Reset the error because we read all response as answer util EOF. */
-            ret = 0;
-            break;
-        }
-        if (ret <= 0) {
-            av_log(s, AV_LOG_ERROR, "WHIP: Failed to read from url=%s, key is %s\n", url, bp->str);
-            goto end;
-        }
-
-        av_bprintf(bp, "%.*s", ret, buf);
-        if (!av_bprint_is_complete(bp)) {
-            av_log(s, AV_LOG_ERROR, "WHIP: Exceed max size %.*s, %s\n", ret, buf, bp->str);
-            ret = AVERROR(EIO);
-            goto end;
-        }
-    }
-
-end:
-    ffurl_closep(&uc);
-    av_dict_free(&opts);
-    return ret;
-}
-
-/**
  * Whether the packet is a DTLS packet.
  */
 static int is_dtls_packet(uint8_t *b, int size) {
@@ -386,276 +313,6 @@ static int is_dtls_packet(uint8_t *b, int size) {
         (version == DTLS_VERSION_10 || version == DTLS_VERSION_12);
 }
 
-/**
- * Generate a SHA-256 fingerprint of an X.509 certificate.
- *
- * @param ctx       AVFormatContext for logging (can be NULL)
- * @param cert      X509 certificate to fingerprint
- * @return          Newly allocated fingerprint string in "AA:BB:CC:…" format,
- *                  or NULL on error (logs via av_log if ctx != NULL).
- *                  Caller must free() the returned string.
- */
-static char *generate_dtls_fingerprint(AVFormatContext *s, X509 *cert)
-{
-    unsigned char md[EVP_MAX_MD_SIZE];
-    int n = 0;
-    AVBPrint fingerprint;
-    char *result = NULL;
-    int i;
-    WHIPContext *whip = s->priv_data;
-    
-    /* To prevent a crash during cleanup, always initialize it. */
-    av_bprint_init(&fingerprint, 0, AV_BPRINT_SIZE_UNLIMITED);
-
-    if (X509_digest(cert, EVP_sha256(), md, &n) != 1) {
-        if (whip)
-            av_log(whip, AV_LOG_ERROR, "DTLS: Failed to generate fingerprint, %s\n",
-                   openssl_get_error(s));
-        goto end;
-    }
-
-    for (i = 0; i < n; i++) {
-        av_bprintf(&fingerprint, "%02X", md[i]);
-        if (i + 1 < n)
-            av_bprintf(&fingerprint, ":");
-    }
-
-    if (!fingerprint.str || !strlen(fingerprint.str)) {
-        if (whip)
-            av_log(whip, AV_LOG_ERROR, "DTLS: Fingerprint is empty\n");
-        goto end;
-    }
-
-    result = av_strdup(fingerprint.str);
-    if (!result) {
-        if (whip)
-            av_log(whip, AV_LOG_ERROR, "DTLS: Out of memory generating fingerprint\n");
-    }
-
-end:
-    av_bprint_finalize(&fingerprint, NULL);
-    return result;
-}
-
-static int openssl_read_certificate(AVFormatContext *s)
-{
-    int ret = 0;
-    BIO *key_b = NULL, *cert_b = NULL;
-    AVBPrint key_bp, cert_bp;
-    AVIOContext *ioc = NULL;
-    WHIPContext *whip = s->priv_data;
-
-
-    /* To prevent a crash during cleanup, always initialize it. */
-    av_bprint_init(&key_bp, 1, MAX_CERTIFICATE_SIZE);
-    av_bprint_init(&cert_bp, 1, MAX_CERTIFICATE_SIZE);
-
-    /* Read key file. */
-    ret = url_read_all(s, whip->key_file, &key_bp);
-    if (ret < 0) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to open key file %s\n", whip->key_file);
-        goto end;
-    }
-
-    if ((key_b = BIO_new(BIO_s_mem())) == NULL) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-
-    BIO_write(key_b, key_bp.str, key_bp.len);
-    whip->dtls_pkey = PEM_read_bio_PrivateKey(key_b, NULL, NULL, NULL);
-    if (!whip->dtls_pkey) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to read private key from %s\n", whip->key_file);
-        ret = AVERROR(EIO);
-        goto end;
-    }
-
-    /* Read certificate. */
-    ret = url_read_all(s, whip->cert_file, &cert_bp);
-    if (ret < 0) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to open cert file %s\n", whip->cert_file);
-        goto end;
-    }
-
-    if ((cert_b = BIO_new(BIO_s_mem())) == NULL) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-
-    BIO_write(cert_b, cert_bp.str, cert_bp.len);
-    whip->dtls_cert = PEM_read_bio_X509(cert_b, NULL, NULL, NULL);
-    if (!whip->dtls_cert) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to read certificate from %s\n", whip->cert_file);
-        ret = AVERROR(EIO);
-        goto end;
-    }
-
-    /* Generate fingerprint. */
-    whip->dtls_fingerprint = generate_dtls_fingerprint(whip, whip->dtls_cert);
-    if (!whip->dtls_fingerprint) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to generate fingerprint from %s\n", whip->cert_file);
-        ret = AVERROR(EIO);
-        goto end;
-    }
-
-end:
-    BIO_free(key_b);
-    av_bprint_finalize(&key_bp, NULL);
-    BIO_free(cert_b);
-    av_bprint_finalize(&cert_bp, NULL);
-    return ret;
-}
-
-static int openssl_dtls_gen_private_key(AVFormatContext *s)
-{
-    int ret = 0;
-    WHIPContext *whip = s->priv_data;
-
-    /**
-     * Note that secp256r1 in openssl is called NID_X9_62_prime256v1 or prime256v1 in string,
-     * not NID_secp256k1 or secp256k1 in string.
-     *
-     * TODO: Should choose the curves in ClientHello.supported_groups, for example:
-     *      Supported Group: x25519 (0x001d)
-     *      Supported Group: secp256r1 (0x0017)
-     *      Supported Group: secp384r1 (0x0018)
-     */
-#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
-    EC_GROUP *ecgroup = NULL;
-    int curve = NID_X9_62_prime256v1;
-#else
-    const char *curve = SN_X9_62_prime256v1;
-#endif
-
-#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
-    whip->dtls_pkey = EVP_PKEY_new();
-    whip->dtls_eckey = EC_KEY_new();
-    ecgroup = EC_GROUP_new_by_curve_name(curve);
-    if (!ecgroup) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Create EC group by curve=%d failed, %s", curve, openssl_get_error(whip));
-        goto einval_end;
-    }
-
-#if OPENSSL_VERSION_NUMBER < 0x10100000L // v1.1.x
-    /* For openssl 1.0, we must set the group parameters, so that cert is ok. */
-    EC_GROUP_set_asn1_flag(ecgroup, OPENSSL_EC_NAMED_CURVE);
-#endif
-
-    if (EC_KEY_set_group(whip->dtls_eckey, ecgroup) != 1) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Generate private key, EC_KEY_set_group failed, %s\n", openssl_get_error(whip));
-        goto einval_end;
-    }
-
-    if (EC_KEY_generate_key(whip->dtls_eckey) != 1) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Generate private key, EC_KEY_generate_key failed, %s\n", openssl_get_error(whip));
-        goto einval_end;
-    }
-
-    if (EVP_PKEY_set1_EC_KEY(whip->dtls_pkey, whip->dtls_eckey) != 1) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Generate private key, EVP_PKEY_set1_EC_KEY failed, %s\n", openssl_get_error(whip));
-        goto einval_end;
-    }
-#else
-    whip->dtls_pkey = EVP_EC_gen(curve);
-    if (!whip->dtls_pkey) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Generate private key, EVP_EC_gen curve=%s failed, %s\n", curve, openssl_get_error(whip));
-        goto einval_end;
-    }
-#endif
-    goto end;
-
-einval_end:
-    ret = AVERROR(EINVAL);
-end:
-#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
-    EC_GROUP_free(ecgroup);
-#endif
-    return ret;
-}
-
-static int openssl_dtls_gen_certificate(AVFormatContext *s)
-{
-    int ret = 0, serial, expire_day, i, n = 0;
-    const char *aor = "lavf";
-    WHIPContext *whip = s->priv_data;
-    X509_NAME* subject = NULL;
-    X509 *dtls_cert = NULL;
-
-    dtls_cert = whip->dtls_cert = X509_new();
-    if (!dtls_cert) {
-        goto enomem_end;
-    }
-
-    // TODO: Support non-self-signed certificate, for example, load from a file.
-    subject = X509_NAME_new();
-    if (!subject) {
-        goto enomem_end;
-    }
-
-    serial = (int)av_get_random_seed();
-    if (ASN1_INTEGER_set(X509_get_serialNumber(dtls_cert), serial) != 1) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to set serial, %s\n", openssl_get_error(whip));
-        goto einval_end;
-    }
-
-    if (X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, aor, strlen(aor), -1, 0) != 1) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to set CN, %s\n", openssl_get_error(whip));
-        goto einval_end;
-    }
-
-    if (X509_set_issuer_name(dtls_cert, subject) != 1) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to set issuer, %s\n", openssl_get_error(whip));
-        goto einval_end;
-    }
-    if (X509_set_subject_name(dtls_cert, subject) != 1) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to set subject name, %s\n", openssl_get_error(whip));
-        goto einval_end;
-    }
-
-    expire_day = 365;
-    if (!X509_gmtime_adj(X509_get_notBefore(dtls_cert), 0)) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to set notBefore, %s\n", openssl_get_error(whip));
-        goto einval_end;
-    }
-    if (!X509_gmtime_adj(X509_get_notAfter(dtls_cert), 60*60*24*expire_day)) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to set notAfter, %s\n", openssl_get_error(whip));
-        goto einval_end;
-    }
-
-    if (X509_set_version(dtls_cert, 2) != 1) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to set version, %s\n", openssl_get_error(whip));
-        goto einval_end;
-    }
-
-    if (X509_set_pubkey(dtls_cert, whip->dtls_pkey) != 1) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to set public key, %s\n", openssl_get_error(whip));
-        goto einval_end;
-    }
-
-    if (!X509_sign(dtls_cert, whip->dtls_pkey, EVP_sha1())) {
-        av_log(whip, AV_LOG_ERROR, "DTLS: Failed to sign certificate, %s\n", openssl_get_error(whip));
-        goto einval_end;
-    }
-
-    whip->dtls_fingerprint = generate_dtls_fingerprint(whip, dtls_cert);
-    if (!whip->dtls_fingerprint) {
-        goto enomem_end;
-    }
-
-    goto end;
-enomem_end:
-    ret = AVERROR(ENOMEM);
-    goto end;
-eio_end:
-    ret = AVERROR(EIO);
-    goto end;
-einval_end:
-    ret = AVERROR(EINVAL);
-end:
-    X509_NAME_free(subject);
-    //av_bprint_finalize(&fingerprint, NULL);
-    return ret;
-}
 
 /**
  * Get or Generate a self-signed certificate and private key for DTLS, 
@@ -667,119 +324,24 @@ static av_cold int certificate_key_init(AVFormatContext *s)
     WHIPContext *whip = s->priv_data;
 
     if (whip->cert_file && whip->key_file) {
-        /* Read the private key and file from the file. */
-        if ((ret = openssl_read_certificate(s)) < 0) {
+        /* Read the private key and certificate from the file. */
+        if ((ret = ssl_read_key_cert(whip->key_file, whip->cert_file, 
+                                     whip->key_buf, sizeof(whip->key_buf),
+                                     whip->cert_buf, sizeof(whip->cert_buf),
+                                     &whip->dtls_fingerprint)) < 0) {
             av_log(s, AV_LOG_ERROR, "DTLS: Failed to read DTLS certificate from cert=%s, key=%s\n",
                 whip->cert_file, whip->key_file);
             return ret;
         }
     } else {
-        /* Generate a private key to ctx->dtls_pkey. */
-        if ((ret = openssl_dtls_gen_private_key(s)) < 0) {
-            av_log(s, AV_LOG_ERROR, "DTLS: Failed to generate DTLS private key\n");
-            return ret;
-        }
-
-        /* Generate a self-signed certificate. */
-        if ((ret = openssl_dtls_gen_certificate(s)) < 0) {
-            av_log(s, AV_LOG_ERROR, "DTLS: Failed to generate DTLS certificate\n");
+        /* Generate a private key to ctx->dtls_pkey and self-signed certificate. */
+        if ((ret = ssl_gen_key_cert(whip->key_buf, sizeof(whip->key_buf), whip->cert_buf, sizeof(whip->cert_buf), &whip->dtls_fingerprint)) < 0) {
+            av_log(s, AV_LOG_ERROR, "DTLS: Failed to generate DTLS private key and certificate\n");
             return ret;
         }
     }
 
     return ret;
-}
-
-// Returns a heap‐allocated null‐terminated string containing
-// the PEM‐encoded public key.  Caller must free().
-static char *pkey_to_pem_string(EVP_PKEY *pkey) {
-    BIO        *mem = NULL;
-    BUF_MEM    *bptr = NULL;
-    char       *pem_str = NULL;
-
-    // 1) Create a memory BIO
-    if ((mem = BIO_new(BIO_s_mem())) == NULL)
-        goto err;
-
-    // 2) Write public key in PEM form
-    if (!PEM_write_bio_PrivateKey(mem, pkey, NULL, NULL, 0, NULL, NULL))
-        goto err;
-
-    // 3) Extract pointer/length
-    BIO_get_mem_ptr(mem, &bptr);
-    if (bptr == NULL || bptr->length == 0)
-        goto err;
-
-    // 4) Allocate string (+1 for NUL)
-    pem_str = malloc(bptr->length + 1);
-    if (pem_str == NULL)
-        goto err;
-
-    // 5) Copy data & NUL‐terminate
-    memcpy(pem_str, bptr->data, bptr->length);
-    pem_str[bptr->length] = '\0';
-
-cleanup:
-    BIO_free(mem);
-    return pem_str;
-
-err:
-    // error path: free and return NULL
-    free(pem_str);
-    pem_str = NULL;
-    goto cleanup;
-}
-
-/**
- * Serialize an X509 certificate to a malloc’d PEM string.
- * Caller must free() the returned pointer.
- */
-static char *cert_to_pem_string(X509 *cert)
-{
-    BIO     *mem = BIO_new(BIO_s_mem());
-    BUF_MEM *bptr = NULL;
-    char    *out = NULL;
-
-    if (!mem) goto err;
-
-    /* Write the PEM certificate */
-    if (!PEM_write_bio_X509(mem, cert))
-        goto err;
-
-    BIO_get_mem_ptr(mem, &bptr);
-    if (!bptr || bptr->length == 0) goto err;
-
-    out = malloc(bptr->length + 1);
-    if (!out) goto err;
-
-    memcpy(out, bptr->data, bptr->length);
-    out[bptr->length] = '\0';
-
-cleanup:
-    BIO_free(mem);
-    return out;
-
-err:
-    free(out);
-    out = NULL;
-    goto cleanup;
-}
-
-/* todo: wrap it for supporting multi ssl lib */
-static int dtls_context_export_srtp_material(AVFormatContext *s)
-{
-    int ret = 0;
-    WHIPContext *whip = s->priv_data;
-    DTLSContext *ctx = whip->dtls_uc->priv_data;
-    const char* dst = "EXTRACTOR-dtls_srtp";
-
-    ret = SSL_export_keying_material(ctx->dtls, whip->dtls_srtp_materials, sizeof(whip->dtls_srtp_materials),
-        dst, strlen(dst), NULL, 0, 0);
-    if (!ret) {
-        av_log(s, AV_LOG_ERROR, "DTLS: Failed to export SRTP material, %s\n", openssl_get_error(s));
-        return -1;
-    }
-    return 0;
 }
 
 /**
@@ -789,16 +351,16 @@ static int dtls_context_on_state(AVFormatContext *s, const char* type, const cha
 {
     int ret = 0;
     WHIPContext *whip = s->priv_data;
-    DTLSContext *ctx = whip->dtls_uc->priv_data;
+    int state = ff_dtls_state(whip->dtls_uc);
 
-    if (ctx->state == DTLS_STATE_CLOSED) {
+    if (state == DTLS_STATE_CLOSED) {
         whip->dtls_closed = 1;
         av_log(whip, AV_LOG_VERBOSE, "WHIP: DTLS session closed, type=%s, desc=%s, elapsed=%dms\n",
             type ? type : "", desc ? desc : "", ELAPSED(whip->whip_starttime, av_gettime()));
         goto error;
     }
 
-    if (ctx->state == DTLS_STATE_FAILED) {
+    if (state == DTLS_STATE_FAILED) {
         whip->state = WHIP_STATE_FAILED;
         av_log(whip, AV_LOG_ERROR, "WHIP: DTLS session failed, type=%s, desc=%s\n",
             type ? type : "", desc ? desc : "");
@@ -806,12 +368,10 @@ static int dtls_context_on_state(AVFormatContext *s, const char* type, const cha
         goto error;
     }
 
-    if (ctx->state == DTLS_STATE_FINISHED && whip->state < WHIP_STATE_DTLS_FINISHED) {
+    if (state == DTLS_STATE_FINISHED && whip->state < WHIP_STATE_DTLS_FINISHED) {
         whip->state = WHIP_STATE_DTLS_FINISHED;
         whip->whip_dtls_time = av_gettime();
-        av_log(whip, AV_LOG_VERBOSE, "WHIP: DTLS handshake, done=%d, arq=%d, cost=%dms, elapsed=%dms\n",
-            ctx->dtls_done_for_us, ctx->dtls_arq_packets, 
-            ELAPSED(ctx->dtls_handshake_starttime, ctx->dtls_handshake_endtime),
+        av_log(whip, AV_LOG_VERBOSE, "WHIP: DTLS handshake is done, elapsed=%dms\n",
             ELAPSED(whip->whip_starttime, av_gettime()));
         return ret;
     }
@@ -821,12 +381,9 @@ error:
 
 static av_cold int dtls_initialize(AVFormatContext *s)
 {
-    int ret;
     WHIPContext *whip = s->priv_data;
-    /* Use the same logging context as AV format. */
-    DTLSContext *dtls_ctx = whip->dtls_uc->priv_data;
     /* reuse the udp created by whip */
-    dtls_ctx->udp_uc = whip->udp_uc;
+    ff_dtls_set_udp(whip->dtls_uc, whip->udp_uc);
     return 0;
 }
 
@@ -1720,11 +1277,9 @@ next_packet:
 
                 ff_url_join(buf, sizeof(buf), "dtls", NULL, whip->ice_host, whip->ice_port, NULL);
                 sprintf(str, "%d", whip->pkt_size);
-                cert_buf = cert_to_pem_string(whip->dtls_cert);
-                key_buf = pkey_to_pem_string(whip->dtls_pkey);
                 av_dict_set(&opts, "mtu", str, 0);
-                av_dict_set(&opts, "cert_buf", cert_buf, 0);
-                av_dict_set(&opts, "key_buf", key_buf, 0);
+                av_dict_set(&opts, "cert_buf", whip->cert_buf, 0);
+                av_dict_set(&opts, "key_buf", whip->key_buf, 0);
                 av_dict_set(&opts, "dtls_fingerprint", whip->dtls_fingerprint, 0);
                 av_dict_set(&opts, "use_external_udp", "1", 0);
                 /* If got the first binding response, start DTLS handshake. */
@@ -1783,8 +1338,7 @@ static int setup_srtp(AVFormatContext *s)
      */
     const char* suite = "SRTP_AES128_CM_HMAC_SHA1_80";
     WHIPContext *whip = s->priv_data;
-    DTLSContext *dtls_ctx = whip->dtls_uc->priv_data;
-    ret = dtls_context_export_srtp_material(s);
+    ret = ff_dtls_export_materials(whip->dtls_uc, whip->dtls_srtp_materials);
     if (ret < 0)
         goto end;
     /**

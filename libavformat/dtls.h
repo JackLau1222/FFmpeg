@@ -22,14 +22,16 @@
 #ifndef AVFORMAT_DTLS_H
 #define AVFORMAT_DTLS_H
 
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-
 #include "libavutil/bprint.h"
 
 #include "libavutil/opt.h"
 #include "internal.h"
 #include "network.h"
+
+/**
+ * Maximum size limit of a certificate and private key size.
+ */
+#define MAX_CERTIFICATE_SIZE 8192
 
 /* Calculate the elapsed time from starttime to endtime in milliseconds. */
 #define ELAPSED(starttime, endtime) ((int)(endtime - starttime) / 1000)
@@ -45,12 +47,7 @@ enum DTLSState {
     DTLS_STATE_FAILED,
 };
 
-typedef struct DTLSContext DTLSContext;
-typedef int (*DTLSContext_on_state_fn)(DTLSContext *ctx, enum DTLSState state, const char* type, const char* desc);
-
-typedef struct DTLSContext {
-    AVClass *av_class;
-
+typedef struct DTLSShared {
     enum DTLSState state;
 
     int use_external_udp;
@@ -59,34 +56,8 @@ typedef struct DTLSContext {
     /* temporarily don't need this to save AVFormatContext point */
     void* opaque;
 
-    /* The DTLS context. */
-    SSL_CTX *dtls_ctx;
-    SSL *dtls;
-    /* The DTLS BIOs. */
-    BIO *bio;
-#if OPENSSL_VERSION_NUMBER >= 0x1010000fL
-    BIO_METHOD* url_bio_method;
-#endif
-
-    /* The private key for DTLS handshake. */
-    EVP_PKEY *dtls_pkey;
-    /* The EC key for DTLS handshake. */
-    EC_KEY* dtls_eckey;
-    /* The SSL certificate used for fingerprint in SDP and DTLS handshake. */
-    X509 *dtls_cert;
     /* The fingerprint of certificate, used in SDP offer. */
     char *dtls_fingerprint;
-
-    /* Whether the DTLS is done at least for us. */
-    int dtls_done_for_us;
-    /* The number of packets retransmitted for DTLS. */
-    int dtls_arq_packets;
-    /**
-     * This is the last DTLS content type and handshake type that is used to detect
-     * the ARQ packet.
-     */
-    uint8_t dtls_last_content_type;
-    uint8_t dtls_last_handshake_type;
 
     /* These variables represent timestamps used for calculating and tracking the cost. */
     int64_t dtls_init_starttime;
@@ -106,6 +77,28 @@ typedef struct DTLSContext {
      * Note that pion requires a smaller value, for example, 1200.
      */
     int mtu;
-} DTLSContext;
+} DTLSShared;
+
+#define DTLS_OPTFL (AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_ENCODING_PARAM)
+#define DTLS_COMMON_OPTIONS(pstruct, options_field) \
+    { "use_external_udp", "Use external UDP from muxer or demuxer", offsetof(pstruct, options_field . use_external_udp), AV_OPT_TYPE_INT, { .i64 = 0}, 0, 1, .flags = DTLS_OPTFL }, \
+    { "mtu", "Maximum Transmission Unit", offsetof(pstruct, options_field . mtu), AV_OPT_TYPE_INT,  { .i64 = 0}, INT64_MIN, INT64_MAX, .flags = DTLS_OPTFL}, \
+    { "dtls_fingerprint", "The optional fingerprint for DTLS", offsetof(pstruct, options_field . dtls_fingerprint), AV_OPT_TYPE_STRING, .flags = DTLS_OPTFL}, \
+    { "cert_buf", "The optional certificate buffer for DTLS", offsetof(pstruct, options_field . cert_buf), AV_OPT_TYPE_STRING, .flags = DTLS_OPTFL}, \
+    { "key_buf", "The optional private key buffer for DTLS", offsetof(pstruct, options_field . key_buf), AV_OPT_TYPE_STRING, .flags = DTLS_OPTFL}
+
+int ff_dtls_open_underlying(DTLSShared *c, URLContext *parent, const char *uri, AVDictionary **options);
+
+int url_read_all(const char *url, AVBPrint *bp);
+
+int ff_dtls_set_udp(URLContext *dtls, URLContext *udp);
+
+int ff_dtls_export_materials(URLContext *dtls, char *dtls_srtp_materials);
+
+int ff_dtls_state(URLContext *dtls);
+
+int ssl_read_key_cert(char *key_url, char *cert_url, char *key_buf, size_t key_sz, char *cert_buf, size_t cert_sz, char **fingerprint);
+
+int ssl_gen_key_cert(char *key_buf, size_t key_sz, char *cert_buf, size_t cert_sz, char **fingerprint);
 
 #endif /* AVFORMAT_DTLS_H */

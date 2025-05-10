@@ -21,6 +21,9 @@
 
 #include "dtls.h"
 
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
 #include "libavutil/mem.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/random_seed.h"
@@ -32,82 +35,451 @@
 #include "srtp.h"
 #include "url.h"
 
-static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length, int incoming);
+// Returns a heap‐allocated null‐terminated string containing
+// the PEM‐encoded public key.  Caller must free().
+static char *pkey_to_pem_string(EVP_PKEY *pkey) {
+    BIO        *mem = NULL;
+    BUF_MEM    *bptr = NULL;
+    char       *pem_str = NULL;
 
-static int ff_dtls_open_underlying(DTLSContext *c, URLContext *parent, const char *uri, AVDictionary **options)
-{
-    int port;
-    char host[200];
-    const char *p;
-    char buf[200];
-    struct addrinfo hints = { 0 }, *ai = NULL;
-    const char *proxy_path;
-    char *env_http_proxy, *env_no_proxy;
-    int use_proxy;
-    int ret;
+    // 1) Create a memory BIO
+    if ((mem = BIO_new(BIO_s_mem())) == NULL)
+        goto err;
 
-    // ret = set_options(c, uri);
-    // if (ret < 0)
-    //     return ret;
+    // 2) Write public key in PEM form
+    if (!PEM_write_bio_PrivateKey(mem, pkey, NULL, NULL, 0, NULL, NULL))
+        goto err;
 
-    // if (c->listen)
-    //     snprintf(opts, sizeof(opts), "?listen=1");
+    // 3) Extract pointer/length
+    BIO_get_mem_ptr(mem, &bptr);
+    if (bptr == NULL || bptr->length == 0)
+        goto err;
 
-    av_url_split(NULL, 0, NULL, 0, host, sizeof(host), &port, NULL, 0, uri);
+    // 4) Allocate string (+1 for NUL)
+    pem_str = malloc(bptr->length + 1);
+    if (pem_str == NULL)
+        goto err;
 
-    av_dict_set_int(options, "connect", 1, 0);
-    av_dict_set_int(options, "fifo_size", 0, 0);
-    /* Set the max packet size to the buffer size. */
-    av_dict_set_int(options, "pkt_size", c->mtu, 0);
+    // 5) Copy data & NUL‐terminate
+    memcpy(pem_str, bptr->data, bptr->length);
+    pem_str[bptr->length] = '\0';
 
-    p = strchr(uri, '?');
+cleanup:
+    BIO_free(mem);
+    return pem_str;
 
-
-    ff_url_join(buf, sizeof(buf), "udp", NULL, host, port, "%s", p);
-
-    hints.ai_flags = AI_NUMERICHOST;
-    if (!getaddrinfo(host, NULL, &hints, &ai)) {
-        // c->numerichost = 1;
-        freeaddrinfo(ai);
-    }
-
-    // if (!host && !(host = av_strdup(host)))
-    //     return AVERROR(ENOMEM);
-
-    env_http_proxy = getenv_utf8("http_proxy");
-    proxy_path = c->http_proxy ? c->http_proxy : env_http_proxy;
-
-    env_no_proxy = getenv_utf8("no_proxy");
-    use_proxy = !ff_http_match_no_proxy(env_no_proxy, host) &&
-                proxy_path && av_strstart(proxy_path, "http://", NULL);
-    freeenv_utf8(env_no_proxy);
-
-    if (use_proxy) {
-        char proxy_host[200], proxy_auth[200], dest[200];
-        int proxy_port;
-        av_url_split(NULL, 0, proxy_auth, sizeof(proxy_auth),
-                     proxy_host, sizeof(proxy_host), &proxy_port, NULL, 0,
-                     proxy_path);
-        ff_url_join(dest, sizeof(dest), NULL, NULL, host, port, NULL);
-        ff_url_join(buf, sizeof(buf), "httpproxy", proxy_auth, proxy_host,
-                    proxy_port, "/%s", dest);
-    }
-
-    freeenv_utf8(env_http_proxy);
-    ret = ffurl_open_whitelist(&c->udp_uc, buf, AVIO_FLAG_READ_WRITE,
-                                &parent->interrupt_callback, options,
-                                parent->protocol_whitelist, parent->protocol_blacklist, parent);
-
-    if (ret < 0) {
-        av_log(c, AV_LOG_ERROR, "WHIP: Failed to connect udp://%s:%d\n", host, port);
-        return ret;
-    }
-
-    /* Make the socket non-blocking, set to READ and WRITE mode after connected */
-    ff_socket_nonblock(ffurl_get_file_handle(c->udp_uc), 1);
-    c->udp_uc->flags |= AVIO_FLAG_READ | AVIO_FLAG_NONBLOCK;
-    return 0;
+err:
+    // error path: free and return NULL
+    free(pem_str);
+    pem_str = NULL;
+    goto cleanup;
 }
+
+/**
+ * Serialize an X509 certificate to a malloc’d PEM string.
+ * Caller must free() the returned pointer.
+ */
+static char *cert_to_pem_string(X509 *cert)
+{
+    BIO     *mem = BIO_new(BIO_s_mem());
+    BUF_MEM *bptr = NULL;
+    char    *out = NULL;
+
+    if (!mem) goto err;
+
+    /* Write the PEM certificate */
+    if (!PEM_write_bio_X509(mem, cert))
+        goto err;
+
+    BIO_get_mem_ptr(mem, &bptr);
+    if (!bptr || bptr->length == 0) goto err;
+
+    out = malloc(bptr->length + 1);
+    if (!out) goto err;
+
+    memcpy(out, bptr->data, bptr->length);
+    out[bptr->length] = '\0';
+
+cleanup:
+    BIO_free(mem);
+    return out;
+
+err:
+    free(out);
+    out = NULL;
+    goto cleanup;
+}
+
+
+/**
+ * Generate a SHA-256 fingerprint of an X.509 certificate.
+ *
+ * @param ctx       AVFormatContext for logging (can be NULL)
+ * @param cert      X509 certificate to fingerprint
+ * @return          Newly allocated fingerprint string in "AA:BB:CC:…" format,
+ *                  or NULL on error (logs via av_log if ctx != NULL).
+ *                  Caller must free() the returned string.
+ */
+static char *generate_dtls_fingerprint(X509 *cert)
+{
+    unsigned char md[EVP_MAX_MD_SIZE];
+    int n = 0;
+    AVBPrint fingerprint;
+    char *result = NULL;
+    int i;
+    
+    /* To prevent a crash during cleanup, always initialize it. */
+    av_bprint_init(&fingerprint, 0, AV_BPRINT_SIZE_UNLIMITED);
+
+    if (X509_digest(cert, EVP_sha256(), md, &n) != 1) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to generate fingerprint, %s\n", openssl_get_error(s));
+        goto end;
+    }
+
+    for (i = 0; i < n; i++) {
+        av_bprintf(&fingerprint, "%02X", md[i]);
+        if (i + 1 < n)
+            av_bprintf(&fingerprint, ":");
+    }
+
+    if (!fingerprint.str || !strlen(fingerprint.str)) {
+        av_log(NULL, AV_LOG_ERROR, "DTLS: Fingerprint is empty\n");
+        goto end;
+    }
+
+    result = av_strdup(fingerprint.str);
+    if (!result) {
+        av_log(NULL, AV_LOG_ERROR, "DTLS: Out of memory generating fingerprint\n");
+    }
+
+end:
+    av_bprint_finalize(&fingerprint, NULL);
+    return result;
+}
+
+int ssl_read_key_cert(char *key_url, char *cert_url, char *key_buf, size_t key_sz, char *cert_buf, size_t cert_sz, char **fingerprint)
+{
+    int ret = 0;
+    BIO *key_b = NULL, *cert_b = NULL;
+    AVBPrint key_bp, cert_bp;
+    EVP_PKEY *pkey;
+    X509 *cert;
+    char *key_tem, *cert_tem;
+
+    /* To prevent a crash during cleanup, always initialize it. */
+    av_bprint_init(&key_bp, 1, MAX_CERTIFICATE_SIZE);
+    av_bprint_init(&cert_bp, 1, MAX_CERTIFICATE_SIZE);
+
+    /* Read key file. */
+    ret = url_read_all(key_url, &key_bp);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to open key file %s\n", key_url);
+        goto end;
+    }
+
+    if ((key_b = BIO_new(BIO_s_mem())) == NULL) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    BIO_write(key_b, key_bp.str, key_bp.len);
+    pkey = PEM_read_bio_PrivateKey(key_b, NULL, NULL, NULL);
+    if (!pkey) {
+        av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to read private key from %s\n", key_url);
+        ret = AVERROR(EIO);
+        goto end;
+    }
+
+    /* Read certificate. */
+    ret = url_read_all(cert_url, &cert_bp);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to open cert file %s\n", cert_url);
+        goto end;
+    }
+
+    if ((cert_b = BIO_new(BIO_s_mem())) == NULL) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    BIO_write(cert_b, cert_bp.str, cert_bp.len);
+    cert = PEM_read_bio_X509(cert_b, NULL, NULL, NULL);
+    if (!cert) {
+        av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to read certificate from %s\n", cert_url);
+        ret = AVERROR(EIO);
+        goto end;
+    }
+
+    key_tem = pkey_to_pem_string(pkey);
+    cert_tem = cert_to_pem_string(cert);
+
+    snprintf(key_buf,  key_sz,  "%s", key_tem);
+    snprintf(cert_buf, cert_sz, "%s", cert_tem);
+
+    /* Generate fingerprint. */
+    *fingerprint = generate_dtls_fingerprint(cert);
+    if (!*fingerprint) {
+        av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to generate fingerprint from %s\n", cert_url);
+        ret = AVERROR(EIO);
+        goto end;
+    }
+
+end:
+    BIO_free(key_b);
+    av_bprint_finalize(&key_bp, NULL);
+    BIO_free(cert_b);
+    av_bprint_finalize(&cert_bp, NULL);
+    return ret;
+}
+
+static int openssl_gen_private_key(EVP_PKEY **pkey, EC_KEY **eckey)
+{
+    int ret = 0;
+
+    /**
+     * Note that secp256r1 in openssl is called NID_X9_62_prime256v1 or prime256v1 in string,
+     * not NID_secp256k1 or secp256k1 in string.
+     *
+     * TODO: Should choose the curves in ClientHello.supported_groups, for example:
+     *      Supported Group: x25519 (0x001d)
+     *      Supported Group: secp256r1 (0x0017)
+     *      Supported Group: secp384r1 (0x0018)
+     */
+#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
+    EC_GROUP *ecgroup = NULL;
+    int curve = NID_X9_62_prime256v1;
+#else
+    const char *curve = SN_X9_62_prime256v1;
+#endif
+
+#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
+    *pkey = EVP_PKEY_new();
+    *eckey = EC_KEY_new();
+    ecgroup = EC_GROUP_new_by_curve_name(curve);
+    if (!ecgroup) {
+        av_log(whip, AV_LOG_ERROR, "DTLS: Create EC group by curve=%d failed, %s", curve, openssl_get_error(whip));
+        goto einval_end;
+    }
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L // v1.1.x
+    /* For openssl 1.0, we must set the group parameters, so that cert is ok. */
+    EC_GROUP_set_asn1_flag(ecgroup, OPENSSL_EC_NAMED_CURVE);
+#endif
+
+    if (EC_KEY_set_group(*eckey, ecgroup) != 1) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Generate private key, EC_KEY_set_group failed, %s\n", openssl_get_error(whip));
+        goto einval_end;
+    }
+
+    if (EC_KEY_generate_key(*eckey) != 1) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Generate private key, EC_KEY_generate_key failed, %s\n", openssl_get_error(whip));
+        goto einval_end;
+    }
+
+    if (EVP_PKEY_set1_EC_KEY(*pkey, *eckey) != 1) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Generate private key, EVP_PKEY_set1_EC_KEY failed, %s\n", openssl_get_error(whip));
+        goto einval_end;
+    }
+#else
+    *pkey = EVP_EC_gen(curve);
+    if (!*pkey) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Generate private key, EVP_EC_gen curve=%s failed, %s\n", curve, openssl_get_error(whip));
+        goto einval_end;
+    }
+#endif
+    goto end;
+
+einval_end:
+    ret = AVERROR(EINVAL);
+end:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
+    EC_GROUP_free(ecgroup);
+#endif
+    return ret;
+}
+
+static int openssl_gen_certificate(EVP_PKEY *pkey, X509 **cert, char **fingerprint)
+{
+    int ret = 0, serial, expire_day;
+    const char *aor = "lavf";
+    X509_NAME* subject = NULL;
+
+    *cert= X509_new();
+    if (!*cert) {
+        goto enomem_end;
+    }
+
+    // TODO: Support non-self-signed certificate, for example, load from a file.
+    subject = X509_NAME_new();
+    if (!subject) {
+        goto enomem_end;
+    }
+
+    serial = (int)av_get_random_seed();
+    if (ASN1_INTEGER_set(X509_get_serialNumber(*cert), serial) != 1) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to set serial, %s\n", openssl_get_error(whip));
+        goto einval_end;
+    }
+
+    if (X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, aor, strlen(aor), -1, 0) != 1) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to set CN, %s\n", openssl_get_error(whip));
+        goto einval_end;
+    }
+
+    if (X509_set_issuer_name(*cert, subject) != 1) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to set issuer, %s\n", openssl_get_error(whip));
+        goto einval_end;
+    }
+    if (X509_set_subject_name(*cert, subject) != 1) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to set subject name, %s\n", openssl_get_error(whip));
+        goto einval_end;
+    }
+
+    expire_day = 365;
+    if (!X509_gmtime_adj(X509_get_notBefore(*cert), 0)) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to set notBefore, %s\n", openssl_get_error(whip));
+        goto einval_end;
+    }
+    if (!X509_gmtime_adj(X509_get_notAfter(*cert), 60*60*24*expire_day)) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to set notAfter, %s\n", openssl_get_error(whip));
+        goto einval_end;
+    }
+
+    if (X509_set_version(*cert, 2) != 1) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to set version, %s\n", openssl_get_error(whip));
+        goto einval_end;
+    }
+
+    if (X509_set_pubkey(*cert, pkey) != 1) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to set public key, %s\n", openssl_get_error(whip));
+        goto einval_end;
+    }
+
+    if (!X509_sign(*cert, pkey, EVP_sha1())) {
+        // av_log(NULL, AV_LOG_ERROR, "DTLS: Failed to sign certificate, %s\n", openssl_get_error(whip));
+        goto einval_end;
+    }
+
+    *fingerprint = generate_dtls_fingerprint(*cert);
+    if (!*fingerprint) {
+        goto enomem_end;
+    }
+
+    goto end;
+enomem_end:
+    ret = AVERROR(ENOMEM);
+    goto end;
+einval_end:
+    ret = AVERROR(EINVAL);
+end:
+    X509_NAME_free(subject);
+    //av_bprint_finalize(&fingerprint, NULL);
+    return ret;
+}
+
+int ssl_gen_key_cert(char *key_buf, size_t key_sz, char *cert_buf, size_t cert_sz, char **fingerprint)
+{
+    int ret = 0;
+    EVP_PKEY *pkey = NULL;
+    EC_KEY *ec_key = NULL;
+    X509 *cert = NULL;
+    char *key_tem, *cert_tem;
+    
+    ret = openssl_gen_private_key(&pkey, &ec_key);
+    if (ret < 0) goto error;
+
+    ret = openssl_gen_certificate(pkey, &cert, fingerprint);
+    if (ret < 0) goto error;
+
+    key_tem = pkey_to_pem_string(pkey);
+    cert_tem = cert_to_pem_string(cert);
+
+    snprintf(key_buf,  key_sz,  "%s", key_tem);
+    snprintf(cert_buf, cert_sz, "%s", cert_tem);
+    
+error:
+    return ret;
+}
+
+typedef struct DTLSContext {
+    AVClass *av_class;
+    DTLSShared dtls_shared;
+    /* The DTLS context. */
+    SSL_CTX *dtls_ctx;
+    SSL *dtls;
+    /* The DTLS BIOs. */
+    BIO *bio;
+#if OPENSSL_VERSION_NUMBER >= 0x1010000fL
+    BIO_METHOD* url_bio_method;
+#endif
+
+    /* The private key for DTLS handshake. */
+    EVP_PKEY *dtls_pkey;
+    /* The EC key for DTLS handshake. */
+    EC_KEY* dtls_eckey;
+    /* The SSL certificate used for fingerprint in SDP and DTLS handshake. */
+    X509 *dtls_cert;
+
+} DTLSContext;
+
+/**
+ * Retrieves the error message for the latest OpenSSL error.
+ *
+ * This function retrieves the error code from the thread's error queue, converts it
+ * to a human-readable string, and stores it in the DTLSContext's error_message field.
+ * The error queue is then cleared using ERR_clear_error().
+ */
+static const char* openssl_get_error(DTLSContext *ctx)
+{
+    int r2 = ERR_get_error();
+    if (r2)
+        ERR_error_string_n(r2, ctx->dtls_shared.error_message, sizeof(ctx->dtls_shared.error_message));
+    else
+        ctx->dtls_shared.error_message[0] = '\0';
+
+    ERR_clear_error();
+    return ctx->dtls_shared.error_message;
+}
+
+/**
+ * Get the error code for the given SSL operation result.
+ *
+ * This function retrieves the error code for the given SSL operation result
+ * and stores the error message in the DTLS context if an error occurred.
+ * It also clears the error queue.
+ */
+static int openssl_ssl_get_error(DTLSContext *ctx, int ret)
+{
+    SSL *dtls = ctx->dtls;
+    int r1 = SSL_ERROR_NONE;
+
+    if (ret <= 0)
+        r1 = SSL_get_error(dtls, ret);
+
+    openssl_get_error(ctx);
+    return r1;
+}
+
+
+static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length, int incoming)
+{
+    uint8_t content_type = 0;
+    uint16_t size = 0;
+    uint8_t handshake_type = 0;
+
+    /* Change_cipher_spec(20), alert(21), handshake(22), application_data(23) */
+    if (length >= 1)
+        content_type = AV_RB8(&data[0]);
+    if (length >= 13)
+        size = AV_RB16(&data[11]);
+    if (length >= 14)
+        handshake_type = AV_RB8(&data[13]);
+
+    av_log(ctx, AV_LOG_VERBOSE, "DTLS: Trace %s, done=%u, len=%u, cnt=%u, size=%u, hs=%u\n",
+        (incoming? "RECV":"SEND"), (ctx->dtls_shared.state == DTLS_STATE_FINISHED ? 1:0 ), length,
+        content_type, size, handshake_type);
+}
+
 
 /**
  * Deserialize a PEM‐encoded private or public key from a NUL-terminated C string.
@@ -165,6 +537,34 @@ static X509 *cert_from_pem_string(const char *pem_str)
     return cert;
 }
 
+int ff_dtls_set_udp(URLContext *dtls, URLContext *udp)
+{
+    DTLSContext *c = dtls->priv_data;
+    c->dtls_shared.udp_uc = udp;
+    return 0;
+}
+
+int ff_dtls_export_materials(URLContext *dtls, char *dtls_srtp_materials)
+{
+    int ret = 0;
+    const char* dst = "EXTRACTOR-dtls_srtp";
+    DTLSContext *c = dtls->priv_data;
+
+    ret = SSL_export_keying_material(c->dtls, dtls_srtp_materials, sizeof(dtls_srtp_materials),
+        dst, strlen(dst), NULL, 0, 0);
+    if (!ret) {
+        av_log(c, AV_LOG_ERROR, "DTLS: Failed to export SRTP material, %s\n", openssl_get_error(c));
+        return -1;
+    }
+    return 0;
+}
+
+int ff_dtls_state(URLContext *dtls)
+{
+    DTLSContext *c = dtls->priv_data;
+    return c->dtls_shared.state;
+}
+
 static int url_bio_create(BIO *b)
 {
 #if OPENSSL_VERSION_NUMBER >= 0x1010000fL
@@ -193,7 +593,7 @@ static int url_bio_destroy(BIO *b)
 static int url_bio_bread(BIO *b, char *buf, int len)
 {
     DTLSContext *c = GET_BIO_DATA(b);
-    int ret = ffurl_read(c->udp_uc, buf, len);
+    int ret = ffurl_read(c->dtls_shared.udp_uc, buf, len);
     if (ret >= 0)
         return ret;
     BIO_clear_retry_flags(b);
@@ -202,7 +602,7 @@ static int url_bio_bread(BIO *b, char *buf, int len)
     if (ret == AVERROR(EAGAIN))
         BIO_set_retry_read(b);
     else
-        c->error_code = ret;
+        c->dtls_shared.error_code = ret;
     // openssl_dtls_state_trace(c, buf, len, 1);
     return -1;
 }
@@ -210,7 +610,7 @@ static int url_bio_bread(BIO *b, char *buf, int len)
 static int url_bio_bwrite(BIO *b, const char *buf, int len)
 {
     DTLSContext *c = GET_BIO_DATA(b);
-    int ret = ffurl_write(c->udp_uc, buf, len);
+    int ret = ffurl_write(c->dtls_shared.udp_uc, buf, len);
     if (ret >= 0)
         return ret;
     BIO_clear_retry_flags(b);
@@ -219,7 +619,7 @@ static int url_bio_bwrite(BIO *b, const char *buf, int len)
     if (ret == AVERROR(EAGAIN))
         BIO_set_retry_write(b);
     else
-        c->error_code = ret;
+        c->dtls_shared.error_code = ret;
     // openssl_dtls_state_trace(c, buf, len, 0);
     return -1;
 }
@@ -253,44 +653,6 @@ static BIO_METHOD url_bio_method = {
 #endif
 
 /**
- * Retrieves the error message for the latest OpenSSL error.
- *
- * This function retrieves the error code from the thread's error queue, converts it
- * to a human-readable string, and stores it in the DTLSContext's error_message field.
- * The error queue is then cleared using ERR_clear_error().
- */
-static const char* openssl_get_error(DTLSContext *ctx)
-{
-    int r2 = ERR_get_error();
-    if (r2)
-        ERR_error_string_n(r2, ctx->error_message, sizeof(ctx->error_message));
-    else
-        ctx->error_message[0] = '\0';
-
-    ERR_clear_error();
-    return ctx->error_message;
-}
-
-/**
- * Get the error code for the given SSL operation result.
- *
- * This function retrieves the error code for the given SSL operation result
- * and stores the error message in the DTLS context if an error occurred.
- * It also clears the error queue.
- */
-static int openssl_ssl_get_error(DTLSContext *ctx, int ret)
-{
-    SSL *dtls = ctx->dtls;
-    int r1 = SSL_ERROR_NONE;
-
-    if (ret <= 0)
-        r1 = SSL_get_error(dtls, ret);
-
-    openssl_get_error(ctx);
-    return r1;
-}
-
-/**
  * Callback function to print the OpenSSL SSL status.
  */
 static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
@@ -320,7 +682,7 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
                 method, alert_type, alert_desc, SSL_alert_desc_string_long(r0), where, r0, r1);
         else
             av_log(ctx, AV_LOG_ERROR, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d %s\n",
-                method, alert_type, alert_desc, SSL_alert_desc_string_long(r0), where, r0, r1, ctx->error_message);
+                method, alert_type, alert_desc, SSL_alert_desc_string_long(r0), where, r0, r1, ctx->dtls_shared.error_message);
 
         /**
          * Notify the DTLS to handle the ALERT message, which maybe means media connection disconnect.
@@ -330,10 +692,10 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
         is_fatal = !av_strncasecmp(alert_type, "fatal", 5);
         is_warning = !av_strncasecmp(alert_type, "warning", 7);
         is_close_notify = !av_strncasecmp(alert_desc, "CN", 2);
-        ctx->state = is_fatal ? DTLS_STATE_FAILED : (is_warning && is_close_notify ? DTLS_STATE_CLOSED : DTLS_STATE_NONE);
-        if (ctx->state != DTLS_STATE_NONE) {
+        ctx->dtls_shared.state = is_fatal ? DTLS_STATE_FAILED : (is_warning && is_close_notify ? DTLS_STATE_CLOSED : DTLS_STATE_NONE);
+        if (ctx->dtls_shared.state != DTLS_STATE_NONE) {
             av_log(ctx, AV_LOG_INFO, "DTLS: Notify ctx=%p, state=%d, fatal=%d, warning=%d, cn=%d\n",
-                ctx, ctx->state, is_fatal, is_warning, is_close_notify);
+                ctx, ctx->dtls_shared.state, is_fatal, is_warning, is_close_notify);
         }
     } else if (where & SSL_CB_EXIT) {
         if (!r0)
@@ -342,31 +704,14 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
         else if (r0 < 0)
             if (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)
                 av_log(ctx, AV_LOG_ERROR, "DTLS: Error method=%s state=%s(%s), where=%d, ret=%d, r1=%d %s\n",
-                    method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1, ctx->error_message);
+                    method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1, ctx->dtls_shared.error_message);
             else
                 av_log(ctx, AV_LOG_VERBOSE, "DTLS: Info method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
                     method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
     }
 }
 
-static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length, int incoming)
-{
-    uint8_t content_type = 0;
-    uint16_t size = 0;
-    uint8_t handshake_type = 0;
 
-    /* Change_cipher_spec(20), alert(21), handshake(22), application_data(23) */
-    if (length >= 1)
-        content_type = AV_RB8(&data[0]);
-    if (length >= 13)
-        size = AV_RB16(&data[11]);
-    if (length >= 14)
-        handshake_type = AV_RB8(&data[13]);
-
-    av_log(ctx, AV_LOG_VERBOSE, "DTLS: Trace %s, done=%u, arq=%u, len=%u, cnt=%u, size=%u, hs=%u\n",
-        (incoming? "RECV":"SEND"), ctx->dtls_done_for_us, ctx->dtls_arq_packets, length,
-        content_type, size, handshake_type);
-}
 
 /**
  * Always return 1 to accept any certificate. This is because we allow the peer to
@@ -409,15 +754,15 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     bio->ptr = p;
 #endif
     /* setup private key and certificate */
-    if (ctx->key_buf)
-        dtls_pkey = pkey_from_pem_string(ctx->key_buf, 1);
+    if (ctx->dtls_shared.key_buf)
+        dtls_pkey = pkey_from_pem_string(ctx->dtls_shared.key_buf, 1);
     else {
         av_log(ctx, AV_LOG_ERROR, "DTLS: Init pkey failed, %s\n", openssl_get_error(ctx));
         ret = AVERROR(EINVAL);
         goto end;
     }
-    if (ctx->cert_buf)
-        dtls_cert = cert_from_pem_string(ctx->cert_buf);
+    if (ctx->dtls_shared.cert_buf)
+        dtls_cert = cert_from_pem_string(ctx->dtls_shared.cert_buf);
     else {
         av_log(ctx, AV_LOG_ERROR, "DTLS: Init cert failed, %s\n", openssl_get_error(ctx));
         ret = AVERROR(EINVAL);
@@ -513,9 +858,9 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
      * packet is split to ensure that each handshake packet is smaller than the MTU.
      */
     SSL_set_options(dtls, SSL_OP_NO_QUERY_MTU);
-    SSL_set_mtu(dtls, ctx->mtu);
+    SSL_set_mtu(dtls, ctx->dtls_shared.mtu);
 #if OPENSSL_VERSION_NUMBER >= 0x100010b0L /* OpenSSL 1.0.1k */
-    DTLS_set_link_mtu(dtls, ctx->mtu);
+    DTLS_set_link_mtu(dtls, ctx->dtls_shared.mtu);
 #endif
 
     ctx->bio = bio;
@@ -538,15 +883,15 @@ static int dtls_start(URLContext *h, const char *url, int flags, AVDictionary **
     int ret = 0, r0, r1;
     SSL *dtls = NULL;
 
-    ctx->dtls_init_starttime = av_gettime();
+    ctx->dtls_shared.dtls_init_starttime = av_gettime();
     
     if ((ret = openssl_dtls_init_context(ctx)) < 0) {
         av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to initialize DTLS context\n");
         return ret;
     }
 
-    if (ctx->use_external_udp != 1) {
-        if ((ret = ff_dtls_open_underlying(ctx, h, url, options)) < 0) {
+    if (ctx->dtls_shared.use_external_udp != 1) {
+        if ((ret = ff_dtls_open_underlying(&ctx->dtls_shared, h, url, options)) < 0) {
             av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to connect %s\n", url);
             return ret;
         }
@@ -554,7 +899,7 @@ static int dtls_start(URLContext *h, const char *url, int flags, AVDictionary **
 
     dtls = ctx->dtls;
 
-    ctx->dtls_handshake_starttime = av_gettime();
+    ctx->dtls_shared.dtls_handshake_starttime = av_gettime();
 
     /* Setup DTLS as passive, which is server role. */
     SSL_set_accept_state(dtls);
@@ -570,19 +915,19 @@ static int dtls_start(URLContext *h, const char *url, int flags, AVDictionary **
      * 
      * The SSL_do_handshake can't be called if DTLS hasn't prepare for udp.
      */
-    if (ctx->use_external_udp != 1) {
+    if (ctx->dtls_shared.use_external_udp != 1) {
         r0 = SSL_do_handshake(dtls);
         r1 = openssl_ssl_get_error(ctx, r0);
         // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
         if (r0 < 0 && (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)) {
-            av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
+            av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, ctx->dtls_shared.error_message);
             return AVERROR(EIO);
         }
     }
 
-    ctx->dtls_init_endtime = av_gettime();
+    ctx->dtls_shared.dtls_init_endtime = av_gettime();
     av_log(ctx, AV_LOG_VERBOSE, "DTLS: Setup ok, MTU=%d, cost=%dms, fingerprint %s\n",
-        ctx->mtu, ELAPSED(ctx->dtls_init_starttime, av_gettime()), ctx->dtls_fingerprint);
+        ctx->dtls_shared.mtu, ELAPSED(ctx->dtls_shared.dtls_init_starttime, av_gettime()), ctx->dtls_shared.dtls_fingerprint);
 
     return ret;
 }
@@ -597,7 +942,7 @@ static int dtls_read(URLContext *h, uint8_t *buf, int size)
     r1 = openssl_ssl_get_error(ctx, r0);
     if (r0 <= 0) {
         if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
-            av_log(ctx, AV_LOG_ERROR, "DTLS: Read failed, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
+            av_log(ctx, AV_LOG_ERROR, "DTLS: Read failed, r0=%d, r1=%d %s\n", r0, r1, ctx->dtls_shared.error_message);
             ret = AVERROR(EIO);
             goto error;
         }
@@ -609,9 +954,8 @@ static int dtls_read(URLContext *h, uint8_t *buf, int size)
     if (SSL_is_init_finished(dtls) != 1)
         goto end;
 
-    ctx->dtls_done_for_us = 1;
-    ctx->state = DTLS_STATE_FINISHED;
-    ctx->dtls_handshake_endtime = av_gettime();
+    ctx->dtls_shared.state = DTLS_STATE_FINISHED;
+    ctx->dtls_shared.dtls_handshake_endtime = av_gettime();
 
 end:
     return size;
@@ -638,7 +982,7 @@ static int dtls_write(URLContext *h, const uint8_t* buf, int size)
     r1 = openssl_ssl_get_error(ctx, r0);
     if (r0 <= 0) {
         if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
-            av_log(ctx, AV_LOG_ERROR, "DTLS: Write failed, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
+            av_log(ctx, AV_LOG_ERROR, "DTLS: Write failed, r0=%d, r1=%d %s\n", r0, r1, ctx->dtls_shared.error_message);
             ret = AVERROR(EIO);
             goto error;
         }
@@ -650,9 +994,8 @@ static int dtls_write(URLContext *h, const uint8_t* buf, int size)
     if (SSL_is_init_finished(dtls) != 1)
         goto end;
 
-    ctx->dtls_done_for_us = 1;
-    ctx->state = DTLS_STATE_FINISHED;
-    ctx->dtls_handshake_endtime = av_gettime();
+    ctx->dtls_shared.state = DTLS_STATE_FINISHED;
+    ctx->dtls_shared.dtls_handshake_endtime = av_gettime();
 
 end:
     return size;
@@ -670,22 +1013,17 @@ static av_cold int dtls_close(URLContext *h)
     SSL_CTX_free(ctx->dtls_ctx);
     X509_free(ctx->dtls_cert);
     EVP_PKEY_free(ctx->dtls_pkey);
-    av_freep(&ctx->dtls_fingerprint);
-    av_freep(&ctx->cert_buf);
-    av_freep(&ctx->key_buf);
+    av_freep(&ctx->dtls_shared.dtls_fingerprint);
+    av_freep(&ctx->dtls_shared.cert_buf);
+    av_freep(&ctx->dtls_shared.key_buf);
 #if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
     EC_KEY_free(ctx->dtls_eckey);
 #endif
     return 0;
 }
 
-#define OFFSET(x) offsetof(DTLSContext, x)
 static const AVOption options[] = {
-    { "use_external_udp", "Use external UDP from muxer or demuxer", OFFSET(use_external_udp), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
-    { "mtu", "Maximum Transmission Unit", OFFSET(mtu), AV_OPT_TYPE_INT, { .i64 = -1}, -1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
-    { "dtls_fingerprint", "The optional fingerprint for DTLS", OFFSET(dtls_fingerprint), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
-    { "cert_buf", "The optional certificate buffer for DTLS", OFFSET(cert_buf), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
-    { "key_buf", "The optional private key buffer for DTLS", OFFSET(key_buf), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
+    DTLS_COMMON_OPTIONS(DTLSContext, dtls_shared),
     { NULL }
 };
 

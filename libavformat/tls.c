@@ -1,6 +1,7 @@
 /*
- * TLS/SSL Protocol
+ * TLS/DTLS/SSL Protocol
  * Copyright (c) 2011 Martin Storsjo
+ * Copyright (c) 2025 Jack Lau
  *
  * This file is part of FFmpeg.
  *

@@ -410,21 +410,11 @@ error:
 typedef struct DTLSContext {
     AVClass *av_class;
     TLSShared tls_shared;
-    /* The DTLS context. */
     SSL_CTX *ctx;
     SSL *ssl;
-    /* The DTLS BIOs. */
-    // BIO *bio;
 #if OPENSSL_VERSION_NUMBER >= 0x1010000fL
     BIO_METHOD* url_bio_method;
 #endif
-    /* The private key for DTLS handshake. */
-    EVP_PKEY *dtls_pkey;
-    /* The EC key for DTLS handshake. */
-    EC_KEY* dtls_eckey;
-    /* The SSL certificate used for fingerprint in SDP and DTLS handshake. */
-    X509 *dtls_cert;
-
     /* Helper for get error code and message. */
     int io_err;
     char error_message[256];
@@ -536,13 +526,13 @@ int ff_dtls_set_udp(URLContext *h, URLContext *udp)
     return 0;
 }
 
-int ff_dtls_export_materials(URLContext *h, char *dtls_srtp_materials)
+int ff_dtls_export_materials(URLContext *h, char *dtls_srtp_materials, size_t materials_sz)
 {
     int ret = 0;
     const char* dst = "EXTRACTOR-dtls_srtp";
     DTLSContext *c = h->priv_data;
 
-    ret = SSL_export_keying_material(c->ssl, dtls_srtp_materials, sizeof(dtls_srtp_materials),
+    ret = SSL_export_keying_material(c->ssl, dtls_srtp_materials, materials_sz,
         dst, strlen(dst), NULL, 0, 0);
     if (!ret) {
         av_log(c, AV_LOG_ERROR, "DTLS: Failed to export SRTP material, %s\n", openssl_get_error(c));
@@ -763,8 +753,8 @@ static int openssl_init_ca_key_cert(URLContext *h)
     int ret;
     DTLSContext *p = h->priv_data;
     TLSShared *c = &p->tls_shared;
-    EVP_PKEY *dtls_pkey = p->dtls_pkey;
-    X509 *dtls_cert = p->dtls_cert;
+    EVP_PKEY *dtls_pkey = NULL;
+    X509 *dtls_cert = NULL;
     /* setup ca, private key, certificate */
     if (c->ca_file) {
         if (!SSL_CTX_load_verify_locations(p->ctx, c->ca_file, NULL))
@@ -812,7 +802,7 @@ static int openssl_init_ca_key_cert(URLContext *h)
         ret = AVERROR(EINVAL);
         goto fail;
     }
-    return 0;
+    ret = 0;
 fail:
     return ret;
 }
@@ -1019,8 +1009,6 @@ static av_cold int dtls_close(URLContext *h)
     DTLSContext *ctx = h->priv_data;
     SSL_free(ctx->ssl);
     SSL_CTX_free(ctx->ctx);
-    X509_free(ctx->dtls_cert);
-    EVP_PKEY_free(ctx->dtls_pkey);
     av_freep(&ctx->tls_shared.fingerprint);
     av_freep(&ctx->tls_shared.cert_buf);
     av_freep(&ctx->tls_shared.key_buf);

@@ -1348,7 +1348,7 @@ static int setup_srtp(AVFormatContext *s)
      */
     const char* suite = "SRTP_AES128_CM_HMAC_SHA1_80";
     WHIPContext *whip = s->priv_data;
-    ret = ff_dtls_export_materials(whip->dtls_uc, whip->dtls_srtp_materials);
+    ret = ff_dtls_export_materials(whip->dtls_uc, whip->dtls_srtp_materials, sizeof(whip->dtls_srtp_materials));
     if (ret < 0)
         goto end;
     /**

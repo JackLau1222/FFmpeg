@@ -100,7 +100,7 @@ int url_read_all(const char *url, AVBPrint *bp);
 
 int ff_dtls_set_udp(URLContext *h, URLContext *udp);
 
-int ff_dtls_export_materials(URLContext *h, char *dtls_srtp_materials);
+int ff_dtls_export_materials(URLContext *h, char *dtls_srtp_materials, size_t materials_sz);
 
 int ff_dtls_state(URLContext *h);
 

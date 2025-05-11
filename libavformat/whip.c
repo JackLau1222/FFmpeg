@@ -1263,7 +1263,7 @@ next_packet:
         }
 
         /* Got nothing, continue to process handshake. */
-        if (ret <= 0)
+        if (ret <= 0 && whip->state < WHIP_STATE_DTLS_CONNECTING)
             continue;
 
         /* Handle the ICE binding response. */
@@ -1300,9 +1300,9 @@ next_packet:
         }
 
         /* If got any DTLS messages, handle it. */
-        if (is_dtls_packet(whip->buf, ret) && whip->state >= WHIP_STATE_ICE_CONNECTED) {
+        if (is_dtls_packet(whip->buf, ret) && whip->state >= WHIP_STATE_ICE_CONNECTED || whip->state == WHIP_STATE_DTLS_CONNECTING) {
             whip->state = WHIP_STATE_DTLS_CONNECTING;
-            if ((ret = ffurl_read(whip->dtls_uc, whip->buf, ret)) < 0)
+            if ((ret = ffurl_handshake(whip->dtls_uc)) < 0)
                 goto end;
             dtls_context_on_state(s, NULL, NULL);
             goto next_packet;

@@ -1733,6 +1733,12 @@ static av_cold int whip_init(AVFormatContext *s)
     int ret;
     WHIPContext *whip = s->priv_data;
 
+    if (s->strict_std_compliance > FF_COMPLIANCE_EXPERIMENTAL) {
+        av_log(s, AV_LOG_ERROR,
+            "WHIP: This muxer is experimental, please set -strict experimental in order to enable it\n");
+        return AVERROR_EXPERIMENTAL;
+    }
+
     if ((ret = initialize(s)) < 0)
         goto end;
 

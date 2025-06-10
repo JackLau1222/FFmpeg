@@ -114,6 +114,7 @@
 /* Referring to Chrome's definition of RTP payload types. */
 #define WHIP_RTP_PAYLOAD_TYPE_H264 106
 #define WHIP_RTP_PAYLOAD_TYPE_OPUS 111
+#define WHIP_RTP_PAYLOAD_TYPE_RTX  105
 
 /**
  * The STUN message header, which is 20 bytes long, comprises the
@@ -149,6 +150,11 @@
  */
 #define WHIP_SDP_SESSION_ID "4489045141692799359"
 #define WHIP_SDP_CREATOR_IP "127.0.0.1"
+
+/**
+ * Retransmission / NACK support
+*/
+#define HISTORY_SIZE_DEFAULT 512
 
 /* Calculate the elapsed time from starttime to endtime in milliseconds. */
 #define ELAPSED(starttime, endtime) ((int)(endtime - starttime) / 1000)
@@ -194,8 +200,15 @@ enum WHIPState {
 };
 
 typedef enum WHIPFlags {
-    WHIP_FLAG_IGNORE_IPV6  = (1 << 0) // Ignore ipv6 candidate
+    WHIP_FLAG_IGNORE_IPV6  = (1 << 0), // Ignore ipv6 candidate
+    WHIP_FLAG_DISABLE_RTX     = (1 << 1)  // Enable NACK and RTX
 } WHIPFlags;
+
+typedef struct RtpHistoryItem {
+        uint16_t seq; // original RTP seq
+        int size; // length in bytes
+        uint8_t* buf; // malloc-ed copy
+} RtpHistoryItem;
 
 typedef struct WHIPContext {
     AVClass *av_class;
@@ -285,6 +298,7 @@ typedef struct WHIPContext {
     /* The SRTP send context, to encrypt outgoing packets. */
     SRTPContext srtp_audio_send;
     SRTPContext srtp_video_send;
+    SRTPContext srtp_video_rtx_send;
     SRTPContext srtp_rtcp_send;
     /* The SRTP receive context, to decrypt incoming packets. */
     SRTPContext srtp_recv;
@@ -309,6 +323,14 @@ typedef struct WHIPContext {
     /* The certificate and private key used for DTLS handshake. */
     char* cert_file;
     char* key_file;
+
+    /* RTX and NACK */
+    uint8_t rtx_payload_type;
+    uint32_t video_rtx_ssrc;
+    uint16_t rtx_seq;
+    int  history_size;
+    RtpHistoryItem *history;  /* ring buffer  */
+    int hist_head;
 } WHIPContext;
 
 /**
@@ -606,6 +628,16 @@ static int generate_sdp_offer(AVFormatContext *s)
     whip->audio_payload_type = WHIP_RTP_PAYLOAD_TYPE_OPUS;
     whip->video_payload_type = WHIP_RTP_PAYLOAD_TYPE_H264;
 
+    /* RTX and NACK init */
+    whip->rtx_payload_type = WHIP_RTP_PAYLOAD_TYPE_RTX;
+    whip->video_rtx_ssrc = av_lfg_get(&whip->rnd);
+    whip->rtx_seq = 0;
+    whip->hist_head = 0;
+    whip->history_size = FFMAX(64, whip->history_size);
+    whip->history = av_calloc(whip->history_size, sizeof(*whip->history));
+    if (!whip->history)
+            return AVERROR(ENOMEM);
+
     av_bprintf(&bp, ""
         "v=0\r\n"
         "o=FFmpeg %s 2 IN IP4 %s\r\n"
@@ -656,7 +688,7 @@ static int generate_sdp_offer(AVFormatContext *s)
         }
 
         av_bprintf(&bp, ""
-            "m=video 9 UDP/TLS/RTP/SAVPF %u\r\n"
+            "m=video 9 UDP/TLS/RTP/SAVPF %u %u\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             "a=ice-ufrag:%s\r\n"
             "a=ice-pwd:%s\r\n"
@@ -669,9 +701,16 @@ static int generate_sdp_offer(AVFormatContext *s)
             "a=rtcp-rsize\r\n"
             "a=rtpmap:%u %s/90000\r\n"
             "a=fmtp:%u level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=%02x%02x%02x\r\n"
+            "a=rtcp-fb:%u nack\r\n"
+            "a=rtpmap:%u rtx/90000\r\n"
+            "a=fmtp:%u apt=%u\r\n"
+            "a=ssrc-group:FID %u %u\r\n"
+            "a=ssrc:%u cname:FFmpeg\r\n"
+            "a=ssrc:%u msid:FFmpeg video\r\n"
             "a=ssrc:%u cname:FFmpeg\r\n"
             "a=ssrc:%u msid:FFmpeg video\r\n",
             whip->video_payload_type,
+            whip->rtx_payload_type,
             whip->ice_ufrag_local,
             whip->ice_pwd_local,
             whip->dtls_fingerprint,
@@ -681,8 +720,16 @@ static int generate_sdp_offer(AVFormatContext *s)
             profile,
             whip->constraint_set_flags,
             level,
+            whip->video_payload_type,
+            whip->rtx_payload_type,
+            whip->rtx_payload_type,
+            whip->video_payload_type,
             whip->video_ssrc,
-            whip->video_ssrc);
+            whip->video_rtx_ssrc,
+            whip->video_ssrc,
+            whip->video_ssrc,
+            whip->video_rtx_ssrc,
+            whip->video_rtx_ssrc);
     }
 
     if (!av_bprint_is_complete(&bp)) {
@@ -1398,6 +1445,12 @@ static int setup_srtp(AVFormatContext *s)
         goto end;
     }
 
+    ret = ff_srtp_set_crypto(&whip->srtp_video_rtx_send, suite, buf);
+    if (ret < 0) {
+        av_log(whip, AV_LOG_ERROR, "Failed to set crypto for video rtx send\n");
+        goto end;
+    }
+
     ret = ff_srtp_set_crypto(&whip->srtp_rtcp_send, suite, buf);
     if (ret < 0) {
         av_log(whip, AV_LOG_ERROR, "Failed to set crypto for rtcp send\n");
@@ -1425,6 +1478,38 @@ static int setup_srtp(AVFormatContext *s)
 
 end:
     return ret;
+}
+
+
+/**
+ * RTX history helpers
+ */
+ static int rtp_history_store(WHIPContext *whip, const uint8_t *buf, int size)
+{
+    int pos = whip->hist_head % whip->history_size;
+    RtpHistoryItem *it = &whip->history[pos];
+    /* free older entry */
+    av_free(it->buf);
+    it->buf = av_malloc(size);
+    if (!it->buf)
+        return AVERROR(ENOMEM);
+
+    memcpy(it->buf, buf, size);
+    it->size = size;
+    it->seq = AV_RB16(buf + 2);
+
+    whip->hist_head = ++pos;
+    return 0;
+}
+
+static const RtpHistoryItem *rtp_history_find(const WHIPContext *whip, uint16_t seq)
+{
+    for (int i = 0; i < whip->history_size; i++) {
+        const RtpHistoryItem *it = &whip->history[i];
+        if (it->buf && it->seq == seq)
+            return it;
+    }
+    return NULL;
 }
 
 /**
@@ -1463,12 +1548,60 @@ static int on_rtp_write_packet(void *opaque, const uint8_t *buf, int buf_size)
         return 0;
     }
 
+    /* Store only ORIGINAL video packets (non-RTX, non-RTCP) */
+    if (!is_rtcp && is_video) {
+        ret = rtp_history_store(whip, buf, buf_size);
+        if (ret < 0) return ret;
+    }
+
     ret = ffurl_write(whip->udp, whip->buf, cipher_size);
     if (ret < 0) {
         av_log(whip, AV_LOG_ERROR, "Failed to write packet=%dB, ret=%d\n", cipher_size, ret);
         return ret;
     }
 
+    return ret;
+}
+/**
+ * See https://datatracker.ietf.org/doc/html/rfc4588
+ * Build and send a single RTX packet
+ */
+static int send_rtx_packet(AVFormatContext *s, const uint8_t *orig_pkt_buf, int orig_size)
+{
+    int ret;
+    WHIPContext *whip = s->priv_data;
+    int new_size, cipher_size;
+    if (whip->flags & WHIP_FLAG_DISABLE_RTX)
+        return 0;
+
+    /* allocate new buffer: header + 2 + payload */
+    if (orig_size + 2 > sizeof(whip->buf))
+        return 0;
+
+    memcpy(whip->buf, orig_pkt_buf, orig_size);
+
+    uint8_t *hdr = whip->buf;
+    uint16_t orig_seq = AV_RB16(hdr + 2);
+
+    /* rewrite header */
+    hdr[1] = (hdr[1] & 0x80) | whip->rtx_payload_type; /* keep M bit */
+    AV_WB16(hdr + 2, whip->rtx_seq++);
+    AV_WB32(hdr + 8, whip->video_rtx_ssrc);
+
+    /* shift payload 2 bytes */
+    memmove(hdr + 12 + 2, hdr + 12, orig_size - 12);
+    AV_WB16(hdr + 12, orig_seq);
+
+    new_size = orig_size + 2;
+
+    /* Encrypt by SRTP and send out. */
+    cipher_size = ff_srtp_encrypt(&whip->srtp_video_rtx_send, whip->buf, new_size, whip->buf, sizeof(whip->buf));
+    if (cipher_size <= 0 || cipher_size < new_size) {
+        av_log(whip, AV_LOG_WARNING, "Failed to encrypt packet=%dB, cipher=%dB\n", new_size, cipher_size);
+        return 0;
+    }
+    ret = ffurl_write(whip->udp, whip->buf, cipher_size);
+    if (ret <= 0) av_log(whip, AV_LOG_ERROR, "Failed to send RTX packet\n");
     return ret;
 }
 
@@ -1778,6 +1911,7 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
     WHIPContext *whip = s->priv_data;
     AVStream *st = s->streams[pkt->stream_index];
     AVFormatContext *rtp_ctx = st->priv_data;
+    uint8_t *buf = NULL;
 
     /* TODO: Send binding request every 1s as WebRTC heartbeat. */
 
@@ -1793,11 +1927,72 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
                 goto end;
             }
         }
+        /**
+         * Handle RTCP NACK
+         * Refer to RFC 4585, Section 6.2.1
+         * The Generic NACK message is identified by PT=RTPFB and FMT=1.
+         * TODO: disable retransmisstion when "-tune zerolatency"
+         */
+        if (media_is_rtcp(whip->buf, ret)) {
+            int ptr = 0;
+            uint8_t pt = whip->buf[ptr + 1];
+            uint8_t fmt = (whip->buf[ptr] & 0x1f);
+            if (ptr + 4 <= ret && pt == 205 && fmt == 1) {
+                /**
+                 * Refer to RFC 3550, Section 6.4.1.
+                 * The length of this RTCP packet in 32-bit words minus one,
+                 * including the header and any padding.
+                 */
+                int rtcp_len = (AV_RB16(&whip->buf[ptr + 2]) + 1) * 4;
+                /* SRTCP index(4 bytes) + HMAC (SRTP_AES128_CM_SHA1_80 10bytes) */
+                int srtcp_len = rtcp_len + 4 + 10;
+                if (srtcp_len == ret && rtcp_len >= 12) {
+                    int i = 0;
+                    buf = av_malloc(srtcp_len);
+                    if (!buf) return AVERROR(ENOMEM);
+                    memcpy(buf, whip->buf, srtcp_len);
+                    int ret = ff_srtp_decrypt(&whip->srtp_recv, buf, &srtcp_len);
+                    if (ret < 0) {
+                        av_log(whip, AV_LOG_ERROR, "NACK packet(SRTCP) decrypt failed: %d, Can't send RTX packet\n", ret);
+                        goto write_packet;
+                    }
+                    while (12 + i < rtcp_len) {
+                        /**
+                         *  See https://datatracker.ietf.org/doc/html/rfc4585#section-6.1
+                         *  Handle multi NACKs in bundled packet.
+                         */
+                        uint16_t pid = AV_RB16(&buf[ptr + 12 + i]);
+                        uint16_t blp = AV_RB16(&buf[ptr + 14 + i]);
+
+                        /* retransmit pid + any bit set in blp */
+                        for (int bit = -1; bit < 16; bit++) {
+                            uint16_t seq = (bit < 0) ? pid : pid + bit + 1;
+                            if (bit >= 0 && !(blp & (1 << bit)))
+                                continue;
+
+                            const RtpHistoryItem *it = rtp_history_find(whip, seq);
+                            if (it) {
+                                av_log(whip, AV_LOG_VERBOSE,
+                                    "NACK, packet found: size: %d, seq=%d, rtx size=%d, lateset stored packet seq:%d\n",
+                                    it->size, seq, ret, whip->history[whip->hist_head-1].seq);
+                                send_rtx_packet(s, it->buf, it->size);
+                            } else {
+                                av_log(whip, AV_LOG_VERBOSE,
+                                    "NACK, packet not found, seq=%d, latest stored packet seq: %d, latest rtx seq: %d\n",
+                                    seq, whip->history[whip->hist_head-1].seq, whip->rtx_seq);
+                            }
+                        }
+                        i = i + 4;
+                    }
+                    av_freep(&buf);
+                }
+            }
+        }
     } else if (ret != AVERROR(EAGAIN)) {
         av_log(whip, AV_LOG_ERROR, "Failed to read from UDP socket\n");
         goto end;
     }
-
+write_packet:
     if (whip->h264_annexb_insert_sps_pps && st->codecpar->codec_id == AV_CODEC_ID_H264) {
         if ((ret = h264_annexb_insert_sps_pps(s, pkt)) < 0) {
             av_log(whip, AV_LOG_ERROR, "Failed to insert SPS/PPS before IDR\n");
@@ -1816,6 +2011,7 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
 end:
+    if (buf) av_freep(&buf);
     if (ret < 0 && whip->state < WHIP_STATE_FAILED)
         whip->state = WHIP_STATE_FAILED;
     if (ret >= 0 && whip->state >= WHIP_STATE_FAILED && whip->dtls_ret < 0)
@@ -1898,6 +2094,8 @@ static const AVOption options[] = {
     { "key_file",           "Optional private key file path for DTLS",              OFFSET(key_file),      AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC },
     { "whip_flags",         "Set flags affecting WHIP connection behavior",             OFFSET(flags),         AV_OPT_TYPE_FLAGS,  { .i64 = 0 },                           0, UINT_MAX, ENC, .unit = "flags" },
     { "ignore_ipv6",        "Ignore any IPv6 ICE candidate",                 0,                     AV_OPT_TYPE_CONST,  { .i64 = WHIP_FLAG_IGNORE_IPV6 },       0, UINT_MAX, ENC, .unit = "flags" },
+    { "disable_rtx", "Disable RFC 4588 RTX", 0, AV_OPT_TYPE_CONST,  { .i64 = WHIP_FLAG_DISABLE_RTX }, 0, UINT_MAX, ENC, .unit = "flags" },
+    { "rtx_history_size", "Packet history size", OFFSET(history_size), AV_OPT_TYPE_INT, { .i64 = HISTORY_SIZE_DEFAULT }, 64, 2048, ENC },
     { NULL },
 };
 

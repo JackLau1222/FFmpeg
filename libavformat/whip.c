@@ -1484,7 +1484,7 @@ end:
 /**
  * RTX history helpers
  */
- static void rtp_history_store(WHIPContext *whip, const uint8_t *buf, int size)
+ static int rtp_history_store(WHIPContext *whip, const uint8_t *buf, int size)
 {
     int pos = whip->hist_head % whip->history_size;
     RtpHistoryItem *it = &whip->history[pos];
@@ -1492,13 +1492,14 @@ end:
     av_free(it->buf);
     it->buf = av_malloc(size);
     if (!it->buf)
-        return;
+        return AVERROR(ENOMEM);
 
     memcpy(it->buf, buf, size);
     it->size = size;
     it->seq = AV_RB16(buf + 2);
 
     whip->hist_head = ++pos;
+    return 0;
 }
 
 static const RtpHistoryItem *rtp_history_find(const WHIPContext *whip, uint16_t seq)
@@ -1548,8 +1549,10 @@ static int on_rtp_write_packet(void *opaque, const uint8_t *buf, int buf_size)
     }
 
     /* Store only ORIGINAL video packets (non-RTX, non-RTCP) */
-    if (!is_rtcp && is_video)
-        rtp_history_store(whip, buf, buf_size);
+    if (!is_rtcp && is_video) {
+        ret = rtp_history_store(whip, buf, buf_size);
+        if (ret < 0) return ret;
+    }
 
     ret = ffurl_write(whip->udp, whip->buf, cipher_size);
     if (ret < 0) {
@@ -1943,6 +1946,7 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
                 if (srtcp_len == ret && rtcp_len >= 12) {
                     int i = 0;
                     buf = av_malloc(srtcp_len);
+                    if (!buf) return AVERROR(ENOMEM);
                     memcpy(buf, whip->buf, srtcp_len);
                     int ret = ff_srtp_decrypt(&whip->srtp_recv, buf, &srtcp_len);
                     if (ret < 0) {

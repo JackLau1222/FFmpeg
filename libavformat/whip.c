@@ -1908,6 +1908,7 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
     WHIPContext *whip = s->priv_data;
     AVStream *st = s->streams[pkt->stream_index];
     AVFormatContext *rtp_ctx = st->priv_data;
+    uint8_t *buf = NULL;
 
     /* TODO: Send binding request every 1s as WebRTC heartbeat. */
 
@@ -1944,12 +1945,14 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
                 int srtcp_len = rtcp_len + 4 + 10;
                 if (srtcp_len == ret && rtcp_len >= 12) {
                     int i = 0;
-                    uint8_t *buf = av_malloc(srtcp_len);
+                    buf = av_malloc(srtcp_len);
                     memcpy(buf, whip->buf, srtcp_len);
                     int ret = ff_srtp_decrypt(&whip->srtp_recv, buf, &srtcp_len);
-                    if (ret < 0)
+                    if (ret < 0) {
                         av_log(whip, AV_LOG_ERROR, "WHIP: SRTCP decrypt failed: %d\n", ret);
-                    while (12 + i < rtcp_len && !ret) {
+                        goto write_packet;
+                    }
+                    while (12 + i < rtcp_len) {
                         /**
                          *  See https://datatracker.ietf.org/doc/html/rfc4585#section-6.1
                          *  Handle multi NACKs in bundled packet.
@@ -1979,7 +1982,7 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
                         }
                         i = i + 4;
                     }
-                    av_free(buf);
+                    av_freep(&buf);
                 }
             }
         }
@@ -1987,7 +1990,7 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
         av_log(whip, AV_LOG_ERROR, "Failed to read from UDP socket\n");
         goto end;
     }
-
+write_packet:
     if (whip->h264_annexb_insert_sps_pps && st->codecpar->codec_id == AV_CODEC_ID_H264) {
         if ((ret = h264_annexb_insert_sps_pps(s, pkt)) < 0) {
             av_log(whip, AV_LOG_ERROR, "Failed to insert SPS/PPS before IDR\n");
@@ -2006,6 +2009,7 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
 end:
+    if (buf) av_freep(&buf);
     if (ret < 0 && whip->state < WHIP_STATE_FAILED)
         whip->state = WHIP_STATE_FAILED;
     if (ret >= 0 && whip->state >= WHIP_STATE_FAILED && whip->dtls_ret < 0)

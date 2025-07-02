@@ -205,12 +205,9 @@ typedef enum WHIPFlags {
 } WHIPFlags;
 
 typedef struct RtpHistoryItem {
-        /* original RTP seq */
-        uint16_t seq;
-        /* length in bytes */
-        int size;
-        /* malloc-ed copy */
-        uint8_t* buf;
+        uint16_t seq; // original RTP seq
+        int size; // length in bytes
+        uint8_t* buf; // malloc-ed copy
 } RtpHistoryItem;
 
 typedef struct WHIPContext {

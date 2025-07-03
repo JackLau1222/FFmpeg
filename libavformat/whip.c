@@ -1568,6 +1568,7 @@ static int on_rtp_write_packet(void *opaque, const uint8_t *buf, int buf_size)
  */
 static int send_rtx_packet(AVFormatContext *s, const uint8_t *orig_pkt_buf, int orig_size)
 {
+    int ret;
     WHIPContext *whip = s->priv_data;
     int new_size, cipher_size;
     if (whip->flags & WHIP_FLAG_DISABLE_RTX)
@@ -1599,7 +1600,9 @@ static int send_rtx_packet(AVFormatContext *s, const uint8_t *orig_pkt_buf, int 
         av_log(whip, AV_LOG_WARNING, "Failed to encrypt packet=%dB, cipher=%dB\n", new_size, cipher_size);
         return 0;
     }
-    return ffurl_write(whip->udp, whip->buf, cipher_size);
+    ret = ffurl_write(whip->udp, whip->buf, cipher_size);
+    if (ret <= 0) av_log(whip, AV_LOG_ERROR, "Failed to send RTX packet\n");
+    return ret;
 }
 
 /**
@@ -1950,7 +1953,7 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
                     memcpy(buf, whip->buf, srtcp_len);
                     int ret = ff_srtp_decrypt(&whip->srtp_recv, buf, &srtcp_len);
                     if (ret < 0) {
-                        av_log(whip, AV_LOG_ERROR, "SRTCP decrypt failed: %d\n", ret);
+                        av_log(whip, AV_LOG_ERROR, "NACK packet(SRTCP) decrypt failed: %d, Can't send RTX packet\n", ret);
                         goto write_packet;
                     }
                     while (12 + i < rtcp_len) {
@@ -1972,9 +1975,7 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
                                 av_log(whip, AV_LOG_VERBOSE,
                                     "NACK, packet found: size: %d, seq=%d, rtx size=%d, lateset stored packet seq:%d\n",
                                     it->size, seq, ret, whip->history[whip->hist_head-1].seq);
-                                ret = send_rtx_packet(s, it->buf, it->size);
-                                if (ret <= 0 && !(whip->flags & WHIP_FLAG_DISABLE_RTX))
-                                    av_log(whip, AV_LOG_ERROR, "Failed to send RTX packet\n");
+                                send_rtx_packet(s, it->buf, it->size);
                             } else {
                                 av_log(whip, AV_LOG_VERBOSE,
                                     "NACK, packet not found, seq=%d, latest stored packet seq: %d, latest rtx seq: %d\n",
